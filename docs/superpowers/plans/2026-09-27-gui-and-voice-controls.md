@@ -953,38 +953,29 @@ def handle_intent(name, ctx, wake_event=None):
 （线程里会闭包引用它）；`ctx["intents"]` 要在 `toggle_mode` / `voice_toggle` **定义之后**才能建
 （它引用这两个函数）。
 
-- [ ] **步骤 5：动作工作线程改按 `kind` 分派，并接住 intent / quit**
+- [ ] **步骤 5：让 `dispatch_action` 接住 `intent` / `quit`**
 
-把 `numpad_worker` 的循环体改成：
+**注意**：动作分派现在**已经**统一在模块级函数 `dispatch_action(action, ctx)` 里了
+（任务 1 的修复把它抽出来的）。所以改它 —— **不要**再去改 `numpad_worker` 的循环体，
+那个循环体已经简化成「取一条 → `dispatch_action`」。
+
+在 `dispatch_action` 的 `if/elif` 链里加两个分支（`wake_event` 从 `ctx["wake_event"]` 取，
+不必给函数加参数）：
 
 ```python
-    def numpad_worker():
-        while not worker_stop.is_set():
-            try:
-                action = numpad_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            try:
-                kind, value, stamp = action
-            except (TypeError, ValueError):
-                continue
-            try:
-                if kind == "intent":
-                    handle_intent(value, ctx, wake_event)
-                elif kind == "quit":
-                    hotkeys.quit_requested.set()
-                elif kind == "force_read":
-                    handle_force_read(ctx)
-                elif kind == "next":
-                    handle_next(ctx)
-                else:
-                    handle_numpad(value, ctx, stamp=stamp)
-            except AdbError as exc:
-                say(f"[!!] {exc}")
-            except Exception:  # noqa: BLE001
-                say("[!!] 处理小键盘操作时出错：")
-                log_exception()
+    if kind == "numpad":
+        handle_numpad(value, ctx, stamp=stamp)
+    elif kind == "next":
+        handle_next(ctx)
+    elif kind == "force_read":
+        handle_force_read(ctx)
+    elif kind == "intent":
+        handle_intent(value, ctx, ctx.get("wake_event"))
+    elif kind == "quit":
+        ctx["hotkeys"].quit_requested.set()
 ```
+
+`handle_intent` 本身在步骤 3 里定义。
 
 - [ ] **步骤 6：给监听传上中断条件**
 

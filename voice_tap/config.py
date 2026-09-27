@@ -106,6 +106,12 @@ class VoiceConfig:
     # 启动时语音是否开启（运行中按 F7 可以随时开关）
     enabled: bool = True
 
+    # 允许说「下一题」翻页（答错进详情页后用它继续）。
+    #
+    # 注意这是**直给**：说了就点固定坐标，不读屏校验 ——
+    # 因此在答题页上误说也会点下去。这是用户明确选择的取舍。
+    next_command: bool = True
+
 
 @dataclass
 class RunConfig:
@@ -324,6 +330,7 @@ def load_config(path=None) -> Config:
         mute_after_click_ms=_pick(v, "mute_after_click_ms", VoiceConfig.mute_after_click_ms,
                                   int, n, "voice"),
         enabled=_pick(v, "enabled", VoiceConfig.enabled, _to_bool, n, "voice"),
+        next_command=_pick(v, "next_command", VoiceConfig.next_command, _to_bool, n, "voice"),
     )
 
     r = data.get("run") or {}

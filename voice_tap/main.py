@@ -535,6 +535,12 @@ def handle_speech(text, logprob, ctx):
     if ctx["cfg"].asr.min_confidence < 0 and logprob < ctx["cfg"].asr.min_confidence:
         say("       [注意] 置信度偏低，识别结果可能是错的")
 
+    # 控制语优先，而且要排在取屏幕之前 —— 因为「下一题」走固定坐标，
+    # 根本不需要读屏。说了就点，这是用户选的「直给」方式。
+    if ctx["cfg"].voice.next_command and matcher.detect_control(text) == "next":
+        handle_next(ctx, source="语音")
+        return
+
     try:
         snap, source = grab_screen(ctx)
     except AdbError as exc:
@@ -628,7 +634,7 @@ def handle_numpad(number, ctx, stamp=None):
     do_click(snap.options[index - 1], ctx, f"小键盘第 {index} 个", key=("numpad", index))
 
 
-def handle_next(ctx):
+def handle_next(ctx, source="小键盘 0"):
     """
     点「下一题」。
 
@@ -638,7 +644,7 @@ def handle_next(ctx):
     配置里给了 fixed_next_position 就直接点那个坐标；
     没给就读屏去找——找按钮比找选项宽松得多，代价是一次读屏。
     """
-    say("[小键盘] 0 → 下一题")
+    say(f"[{source}] 下一题")
     started = time.monotonic()
     cfg = ctx["cfg"].hotkey
 

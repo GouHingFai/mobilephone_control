@@ -458,5 +458,23 @@ class TestRealScreenEndToEnd(unittest.TestCase):
         self.assertEqual(result.node.text, "v. 猛咬")
 
 
+class TestDetectControl(unittest.TestCase):
+    """
+    控制语：说这些话不是要选某个选项，而是要程序做一件事（目前只有「下一题」）。
+
+    它必须**优先于**选项匹配 —— 否则「下一题」会被拿去和选项比对，永远匹配不上。
+    """
+
+    def test_next_phrases(self):
+        for spoken in ("下一题", "下一词", "下一个", "继续", "next", "说下一题", "下一题吧"):
+            with self.subTest(spoken=spoken):
+                self.assertEqual(matcher.detect_control(spoken), "next")
+
+    def test_not_control(self):
+        for spoken in ("清晰", "proliferate", "1", "", "extol"):
+            with self.subTest(spoken=spoken):
+                self.assertIsNone(matcher.detect_control(spoken))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

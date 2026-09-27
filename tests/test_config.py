@@ -144,5 +144,19 @@ class TestVoiceMuteDuration(unittest.TestCase):
             "若是你有意改的，请同步改这个测试并注明理由")
 
 
+class TestVoiceNextCommand(unittest.TestCase):
+
+    def test_code_default_is_on(self):
+        self.assertTrue(cfgmod.VoiceConfig.next_command)
+
+    def test_shipped_config_is_on(self):
+        real = Path(__file__).resolve().parent.parent / "config.yaml"
+        self.assertTrue(cfgmod.load_config(real).voice.next_command)
+
+    def test_parsed_off(self):
+        cfg = load_yaml("voice:\n  next_command: 关\n")
+        self.assertFalse(cfg.voice.next_command)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

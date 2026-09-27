@@ -1022,5 +1022,38 @@ class TestActionWiring(unittest.TestCase):
         self.assertEqual(fake.taps, [])
 
 
+class TestVoiceNextCommand(unittest.TestCase):
+    """说「下一题」= 点下一题（直给：不读屏校验）"""
+
+    def _ctx(self, xml):
+        ctx, fake = make_ctx(xml)
+        ctx["cfg"].hotkey.fixed_next_position = (909, 2476)
+        return ctx, fake
+
+    def test_saying_next_clicks_the_button(self):
+        ctx, fake = self._ctx(DETAIL_XML)
+
+        app.handle_speech("下一题", -0.4, ctx)
+
+        self.assertEqual(fake.taps, [(909, 2476)])
+        self.assertEqual(fake.dump_calls, 0, "固定坐标不该读屏")
+
+    def test_works_on_quiz_page_too(self):
+        """直给：答题页上说了照样点（用户明确接受这个取舍）"""
+        ctx, fake = self._ctx(GRE_XML)
+
+        app.handle_speech("下一题", -0.4, ctx)
+
+        self.assertEqual(fake.taps, [(909, 2476)])
+
+    def test_disabled_by_config(self):
+        ctx, fake = self._ctx(DETAIL_XML)
+        ctx["cfg"].voice.next_command = False
+
+        app.handle_speech("下一题", -0.4, ctx)
+
+        self.assertEqual(fake.taps, [], "关掉之后不该点；应落回普通匹配并提示详情页")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

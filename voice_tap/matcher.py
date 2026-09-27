@@ -248,6 +248,33 @@ def parse_ordinal(spoken):
     return None
 
 
+# 控制语：说这些话不是要选某个选项，而是要程序做一件事。
+# 目前只有「下一题」一种 —— 答错进详情页后用它继续。
+#
+# 判定用「包含」而不是「相等」：ASR 常在前后带上零碎字词
+# （「说下一题」「下一题吧」），只要里面出现了这个词，就是那个意思。
+NEXT_PHRASES = (
+    "下一题", "下一词", "下一首", "下一个", "下一组", "下一关",
+    "继续", "next",
+)
+
+
+def detect_control(text):
+    """
+    看一眼识别出的文字里有没有控制语。
+
+    返回 "next" 表示「去点下一题」，没有则返回 None。
+    必须**优先于**选项匹配调用 —— 否则「下一题」会被拿去和选项比对。
+    """
+    key = normalize(text)
+    if not key:
+        return None
+    for phrase in NEXT_PHRASES:
+        if normalize(phrase) in key:
+            return "next"
+    return None
+
+
 @dataclass
 class Candidate:
     node: object
