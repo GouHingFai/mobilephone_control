@@ -341,6 +341,73 @@ class ScreenPrefetcher:
         threading.Thread(target=work, daemon=True, name="prefetch-after-click").start()
 
 
+# ---------------------------------------------------------------- 动作队列接线
+#
+# 「按下一个键」到「真的执行这个动作」中间隔着一条流水线：
+#
+#     热键回调（按键那一刻）→ 盖戳 → 入队 → 工作线程解包 → 分派 → 处理函数
+#
+# 这条线以前是写在 main() 的三个 lambda 和一个闭包里的，外部调不到 ——
+# 于是谁把 `("numpad", n, 戳)` 写成两元组、或者把解包写反，测试也照绿，
+# 而真机上就是那个「连按两下点到新题」的老毛病。抽成模块级函数就是为了能钉住它。
+
+
+def make_action_putters(queue, prefetcher):
+    """
+    造三个「把动作塞进队列」的回调，供热键注册使用。
+
+    **盖戳的时机就在这儿**：回调跑在按键那一刻，所以这时候取 `prefetcher.identity()`，
+    拿到的就是「按下时屏幕上是什么」。这个戳一路带到工作线程，执行前用来核对。
+
+    返回一个字典（键就是热键管理器要的回调名），免得靠位置记顺序：
+
+        on_option(n)     —— 点第 n 个选项，带戳
+        on_next()        —— 点「下一题」，带戳
+        on_force_read()  —— 强制读屏，**不带戳**（它跟界面无关，只是重新同步）
+    """
+    def on_option(n):
+        queue.put(("numpad", n, prefetcher.identity()))
+
+    def on_next():
+        queue.put(("next", None, prefetcher.identity()))
+
+    def on_force_read():
+        # 强制读屏的目的就是把程序手里那份旧界面丢掉重读，
+        # 所以它跟「按下时是哪一屏」无关，不盖章。
+        queue.put(("force_read", None, None))
+
+    return {
+        "on_option": on_option,
+        "on_next": on_next,
+        "on_force_read": on_force_read,
+    }
+
+
+def dispatch_action(action, ctx):
+    """
+    执行一个动作队列条目。解包 `(kind, value, stamp)` 后按 kind 分派。
+
+    做成独立函数（而不是塞在工作线程的闭包里），是为了能单测 ——
+    这段「格式对不对、有没有分派错」是最容易悄悄坏掉的地方。
+
+    分派表就写在下面这几行。将来加新动作（比如语音意图、退出），
+    在这儿加一个 elif 即可；**认不出来的 kind 一律当没看见** ——
+    宁可什么都不做，也不能把不认识的东西当成「点一下」扔出去。
+    """
+    try:
+        kind, value, stamp = action
+    except (TypeError, ValueError):
+        # 格式不对（不是长度 3 的可解包对象）：直接忽略，不抛异常。
+        # 这是工作线程的最后一道关口 —— 半截元组、None、一个数字之类的东西
+        # 不该把线程掀翻，更不该冒出一个「点一下」的副作用。
+        return
+
+    if kind == "numpad":
+        handle_numpad(value, ctx, stamp=stamp)
+    elif kind == "next":
+        handle_next(ctx)
+    elif kind == "force_read":
+        handle_force_read(ctx)
 
 
 # ---------------------------------------------------------------- 主流程
@@ -825,16 +892,7 @@ def main(argv=None):
             except queue.Empty:
                 continue
             try:
-                kind, value, stamp = action
-            except (TypeError, ValueError):
-                continue
-            try:
-                if kind == "force_read":
-                    handle_force_read(ctx)
-                elif kind == "next":
-                    handle_next(ctx)
-                else:
-                    handle_numpad(value, ctx, stamp=stamp)
+                dispatch_action(action, ctx)
             except AdbError as exc:
                 say(f"[!!] {exc}")
             except Exception:  # noqa: BLE001
@@ -855,11 +913,14 @@ def main(argv=None):
     def voice_toggle():
         ctx["voice_gate"].toggle()
 
+    # 三个按键回调：盖戳 → 入队。盖戳的时机（按键那一刻）封装在 make_action_putters 里。
+    putters = make_action_putters(numpad_queue, ctx["prefetcher"])
+
     if not hotkeys.start(
         on_toggle=toggle_mode,
-        on_option=lambda n: numpad_queue.put(("numpad", n, ctx["prefetcher"].identity())),
-        on_next=lambda: numpad_queue.put(("next", None, ctx["prefetcher"].identity())),
-        on_force_read=lambda: numpad_queue.put(("force_read", None, None)),
+        on_option=putters["on_option"],
+        on_next=putters["on_next"],
+        on_force_read=putters["on_force_read"],
         on_toggle_voice=voice_toggle,
     ) and mode == "hotkey":
         say("      [注意] 热键不可用，先用常驻监听模式跑")

@@ -829,5 +829,198 @@ class TestActionStamp(unittest.TestCase):
         self.assertEqual(len(fake.taps), 1)
 
 
+class RecordingQueue:
+    """假队列：只把 put 进来的东西记下来，不真的排队"""
+
+    def __init__(self):
+        self.items = []
+
+    def put(self, item):
+        self.items.append(item)
+
+
+class TestActionWiring(unittest.TestCase):
+    """
+    「盖戳 → 入队 → 解包分派」这条接线。
+
+    上一轮只测了后半截「核对时戳」（见 TestActionStamp），
+    而把时戳**做出来、送进队列、再从队列里分派出去**这段，原本写在
+    main() 的三个 lambda 和一个闭包里，外部调不到 ——
+    于是谁把它改坏了（比如忘带戳、把两元组当三元组解、把分派写反），
+    227 个测试照样全绿，而真机上「连按两下点到新题」原样复现。
+
+    所以现在这段被抽成 make_action_putters / dispatch_action 两个模块级函数，
+    在这里直接钉住它的**可观察后果**（队列里真有那条、真的点了那一下），
+    而不是去 monkeypatch 模块级处理函数 —— 那样测到的是桩，不是接线。
+    """
+
+    # ---------------------------------------------------------- 盖戳
+
+    def _prefetcher_with(self, xml=GRE_XML):
+        """造一个已经「见过一屏」的真 ScreenPrefetcher"""
+        cfg = Config()
+        fake = FakeAdb(xml)
+        pref = app.ScreenPrefetcher(fake, cfg, log=lambda *_: None)
+        pref.note(screen.read_screen(xml))
+        return pref
+
+    def test_on_option_puts_number_with_the_stamp(self):
+        pref = self._prefetcher_with()
+        expected = app.ScreenPrefetcher.signature(screen.read_screen(GRE_XML))
+        q = RecordingQueue()
+
+        app.make_action_putters(q, pref)["on_option"](3)
+
+        self.assertEqual(q.items, [("numpad", 3, expected)],
+                         "点选项要入队三元组 (\"numpad\", 几号, 按键时的屏幕指纹)")
+
+    def test_on_next_puts_next_with_the_stamp(self):
+        pref = self._prefetcher_with()
+        expected = app.ScreenPrefetcher.signature(screen.read_screen(GRE_XML))
+        q = RecordingQueue()
+
+        app.make_action_putters(q, pref)["on_next"]()
+
+        self.assertEqual(q.items, [("next", None, expected)],
+                         "「下一题」也要带戳 —— 它一样会点到新界面上")
+
+    def test_on_force_read_has_no_stamp(self):
+        """强制读屏跟界面无关，不带戳（带了反而会被误拦）"""
+        pref = self._prefetcher_with()
+        q = RecordingQueue()
+
+        app.make_action_putters(q, pref)["on_force_read"]()
+
+        self.assertEqual(q.items, [("force_read", None, None)])
+
+    def test_stamp_is_taken_at_press_not_at_execution(self):
+        """
+        戳必须在**按下那一刻**取。
+
+        这条正是那个真机 bug 的要点：按下的那一屏，和轮到执行时的屏幕，
+        中间可能已经翻过页了。戳要是取晚了（比如在工作线程里才取），
+        它就会等于「新那一屏」，核对时永远相等，等于没拦。
+        """
+        pref = self._prefetcher_with()
+        pressed = pref.identity()                    # 按下那一刻：第一题
+        q = RecordingQueue()
+        putters = app.make_action_putters(q, pref)
+
+        putters["on_option"](2)                      # 按下
+
+        pref.note(screen.read_screen(SECOND_XML))     # 按完才翻页
+
+        self.assertEqual(q.items[0], ("numpad", 2, pressed),
+                         "戳是按下时的屏幕，事后翻页不该把它改掉")
+
+    def test_stamp_is_none_before_any_screen_read(self):
+        """还没读到过任何界面时，戳就是 None —— 别硬编个假的出来"""
+        pref = self._prefetcher_with()
+        pref._last_seen = None
+        q = RecordingQueue()
+
+        app.make_action_putters(q, pref)["on_option"](1)
+
+        self.assertIsNone(q.items[0][2])
+
+    # ---------------------------------------------------------- 解包分派
+
+    def test_dispatch_numpad_really_clicks(self):
+        """numpad 动作要走到底、真的点一下第 1 个选项"""
+        ctx, fake = make_ctx(GRE_XML)
+        ctx["cfg"].click.debounce_ms = 0
+
+        app.dispatch_action(("numpad", 1, None), ctx)
+
+        self.assertEqual(len(fake.taps), 1, "numpad 动作应该真点一下")
+        _, y = fake.taps[0]
+        self.assertTrue(736 <= y <= 886, f"应该点第 1 个选项，实际 y={y}")
+
+    def test_dispatch_next_clicks_the_next_button(self):
+        """next 动作去点「下一题」，而不是被当成点选项"""
+        ctx, fake = make_ctx(DETAIL_XML)
+
+        app.dispatch_action(("next", None, None), ctx)
+
+        self.assertEqual(fake.taps, [(600, 2180)],
+                         "next 应该点到「下一题」按钮中心")
+
+    def test_dispatch_force_read_reads_and_does_not_click(self):
+        """force_read 只重读一次屏，不点任何东西"""
+        ctx, fake = make_ctx(GRE_XML)
+
+        app.dispatch_action(("force_read", None, None), ctx)
+
+        self.assertEqual(fake.dump_calls, 1, "强制读屏应该当场读一次")
+        self.assertEqual(fake.taps, [], "强制读屏不该顺带点东西")
+
+    def test_dispatch_does_not_swallow_the_stamp(self):
+        """
+        分派时必须把戳**原样传给** handle_numpad。
+
+        这里让界面在按键后翻了页：戳对不上就该不点。
+        要是 dispatch_action 忘了传 stamp（比如写成 handle_numpad(value, ctx)），
+        这一下就会照点不误 —— 真机上就是「连按两下点到新题」。
+        """
+        cfg = Config()
+        cfg.prefetch.after_click = False
+        cfg.click.settle_ms = 0
+        fake = FakeAdb(GRE_XML)
+        pref = app.ScreenPrefetcher(fake, cfg, log=lambda *_: None)
+        pref.note(screen.read_screen(GRE_XML))
+        ctx = {
+            "adb": fake,
+            "cfg": cfg,
+            "preview": False,
+            "recognizer": StubRecognizer(),
+            "prefetcher": pref,
+            "voice_gate": StubVoiceGate(),
+            "clicker": Clicker(fake, cfg.click, log=lambda *_: None),
+        }
+        action = ("numpad", 1, pref.identity())      # 按下时：第一题
+
+        pref.note(screen.read_screen(SECOND_XML))    # 翻到第二题
+        fake.xml = SECOND_XML
+
+        app.dispatch_action(action, ctx)
+
+        self.assertEqual(fake.taps, [], "界面已变，这一下不能点 —— 戳必须传到")
+
+    # ---------------------------------------------------------- 坏格式不崩
+
+    def test_malformed_action_is_ignored_silently(self):
+        """
+        格式不对的条目一律忽略：不抛异常，也不产生点击。
+
+        这是工作线程的最后一道关口 —— 半截元组、None、一个数字之类的东西
+        不该把线程掀翻，更不该冒出一个「点一下」的副作用。
+        """
+        bad_actions = [
+            3,                      # 根本不是可迭代对象
+            None,
+            ("numpad",),            # 太短
+            ("numpad", 1),          # 少了戳
+            ("numpad", 1, None, 2), # 太长
+            (),
+            "numpad",               # 字符串（会被逐字符拆开，但长度也不对）
+            "abc",                  # 长度 3 的字符串：解出来 kind 认不出，也不该点
+            "abcdef",
+        ]
+
+        for bad in bad_actions:
+            with self.subTest(bad=bad):
+                ctx, fake = make_ctx(GRE_XML)
+                app.dispatch_action(bad, ctx)        # 不该抛异常
+                self.assertEqual(fake.taps, [], f"{bad!r} 不该点任何东西")
+
+    def test_unknown_kind_is_ignored(self):
+        """将来加了 kind 而分支没跟上时，宁可什么都不做，也不能乱点"""
+        ctx, fake = make_ctx(GRE_XML)
+
+        app.dispatch_action(("nonsense", 1, None), ctx)
+
+        self.assertEqual(fake.taps, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

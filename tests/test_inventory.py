@@ -30,7 +30,7 @@ BASELINE_COUNTS = {
     "tests.test_config": 17,
     "tests.test_hotkey": 25,
     "tests.test_matcher": 51,
-    "tests.test_pipeline": 43,
+    "tests.test_pipeline": 54,
     "tests.test_prefetch": 26,
     "tests.test_screen": 27,
     "tests.test_voice_gate": 11,

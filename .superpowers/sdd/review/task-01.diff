@@ -1,0 +1,204 @@
+commit 0d09a858d00926be30ddb1c609858adeb6b19f6d
+Author: voice_tap dev <dev@localhost>
+Date:   Sun Sep 27 20:13:18 2026 +0800
+
+    fix: 动作时戳 —— 连按两下同一个键不再点到新题上
+    
+    在第一题上连按两下 1 时，第一下点完会作废缓存并启动后台预读；
+    第二下还在队列里排队，等它被处理时预读已经读回了第二题，
+    于是照着第二题点了第 1 个 —— 第一题时做的动作被用到了第二题上。
+    
+    - ScreenPrefetcher.identity()：返回最近见过那一屏的指纹，无数据时 None
+    - handle_numpad() 新增 stamp 参数：执行前核对指纹，翻页了就丢弃这一下
+    - 动作队列条目统一为 (kind, value, stamp)，kind ∈ {numpad, next, force_read}
+    - 小键盘回调入队时盖上「按键那一刻」的戳
+    
+    新增 5 个测试（tests/test_pipeline.py::TestActionStamp），全套 227 个通过。
+
+diff --git a/tests/test_pipeline.py b/tests/test_pipeline.py
+index 63ae380..a5d0962 100644
+--- a/tests/test_pipeline.py
++++ b/tests/test_pipeline.py
+@@ -26,6 +26,8 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
+ 
+ GRE_XML = (FIXTURES / "gre_degrade.xml").read_text(encoding="utf-8")
+ 
++SECOND_XML = (FIXTURES / "gre_prototype.xml").read_text(encoding="utf-8")
++
+ QQ_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+ <hierarchy rotation="0">
+   <node index="0" text="" class="android.widget.FrameLayout" package="com.tencent.mobileqq"
+@@ -760,5 +762,72 @@ class TestStartupProbe(unittest.TestCase):
+         self.assertIsNone(prefetcher.take(), "读不到就别往缓存里塞东西")
+ 
+ 
++class TestActionStamp(unittest.TestCase):
++    """
++    按键动作要带「按键那一刻的屏幕」的戳；执行前核对，屏幕变了就不点。
++
++    由来（真机上实测到的 bug）：在第一题上连按两下 `1`，
++    第一下点完立刻作废缓存并启动后台预读；第二下还在队列里排队，
++    等它被处理时预读已经读回了**第二题**，于是照着第二题点了第 1 个。
++    根子是：**第一题时做的动作，被用到了第二题上。**
++    """
++
++    def _setup(self, xml=GRE_XML):
++        cfg = Config()
++        cfg.prefetch.after_click = False     # 别让后台预读来搅乱
++        cfg.click.settle_ms = 0
++        fake = FakeAdb(xml)
++        pref = app.ScreenPrefetcher(fake, cfg, log=lambda *_: None)
++        pref.note(screen.read_screen(xml))
++        ctx = {
++            "adb": fake,
++            "cfg": cfg,
++            "preview": False,
++            "recognizer": StubRecognizer(),
++            "prefetcher": pref,
++            "voice_gate": StubVoiceGate(),
++            "clicker": Clicker(fake, cfg.click, log=lambda *_: None),
++        }
++        return ctx, fake, pref
++
++    def test_identity_is_none_before_any_read(self):
++        fake = FakeAdb(GRE_XML)
++        pref = app.ScreenPrefetcher(fake, Config(), log=lambda *_: None)
++        self.assertIsNone(pref.identity(), "还没读到过任何界面时不该有指纹")
++
++    def test_identity_reflects_last_seen_screen(self):
++        _ctx, _fake, pref = self._setup()
++        expected = app.ScreenPrefetcher.signature(screen.read_screen(GRE_XML))
++        self.assertEqual(pref.identity(), expected)
++
++    def test_dropped_when_screen_changed_since_press(self):
++        """按键时是第一题，轮到执行时已经翻到第二题 —— 必须不点"""
++        ctx, fake, pref = self._setup()
++        stamp = pref.identity()                     # 按键那一刻：第一题
++        pref.note(screen.read_screen(SECOND_XML))   # 界面翻了页
++        fake.xml = SECOND_XML
++
++        app.handle_numpad(1, ctx, stamp=stamp)
++
++        self.assertEqual(fake.taps, [], "界面已经变了，这一下不能点")
++
++    def test_runs_when_screen_unchanged(self):
++        """界面没翻（比如那一下没生效）—— 照常点，这正是「按错键马上改」要的"""
++        ctx, fake, pref = self._setup()
++        stamp = pref.identity()
++
++        app.handle_numpad(1, ctx, stamp=stamp)
++
++        self.assertEqual(len(fake.taps), 1)
++
++    def test_runs_when_no_stamp_given(self):
++        """没盖戳（比如语音路径）时不做拦截"""
++        ctx, fake, _pref = self._setup()
++
++        app.handle_numpad(1, ctx)
++
++        self.assertEqual(len(fake.taps), 1)
++
++
+ if __name__ == "__main__":
+     unittest.main(verbosity=2)
+diff --git a/voice_tap/main.py b/voice_tap/main.py
+index 6fed397..bd1ba9b 100644
+--- a/voice_tap/main.py
++++ b/voice_tap/main.py
+@@ -210,6 +210,19 @@ class ScreenPrefetcher:
+         with self._lock:
+             return self._miss
+ 
++    def identity(self):
++        """
++        最近见过那一屏的指纹；还没读到过任何界面时返回 None。
++
++        用途是给按键动作盖章：按下的那一刻记下「当时屏幕长什么样」，
++        真正执行前再比一次 —— 不一样，就说明中间翻了页，这一下不能点。
++        （参见 handle_numpad 的 stamp 参数与 tests 里的 TestActionStamp。）
++        """
++        with self._lock:
++            if self._last_seen is None:
++                return None
++            return self.signature(self._last_seen)
++
+     def take_or_wait(self, timeout=8.0):
+         """
+         取缓存；如果正好有一次预读在跑，**先等它跑完再取**。
+@@ -493,7 +506,7 @@ def handle_speech(text, logprob, ctx):
+     do_click(result.node, ctx, description)
+ 
+ 
+-def handle_numpad(number, ctx):
++def handle_numpad(number, ctx, stamp=None):
+     """
+     小键盘按下数字：点第 number 个选项。
+ 
+@@ -507,6 +520,14 @@ def handle_numpad(number, ctx):
+     提速的正解不是「跳过读屏」，而是**把读屏提前做**：点完立刻在后台把下一屏
+     读好（见 ScreenPrefetcher），按键时直接用那份结果 —— 坐标依然是系统报的
+     当前值，一点没「猜」。只有没预读成时才当场读一次兜底（日志会明说）。
++
++    `stamp`（动作时戳，可为 None）是**按下按键那一刻**的屏幕指纹，由调用方
++    （热键回调）从 ScreenPrefetcher.identity() 取来。这个参数是为了修一个
++    真机上实测到的 bug：在第一题上连按两下 `1`，第一下点完立刻作废缓存并启动
++    后台预读；第二下还在队列里排队，等它被处理时预读已经读回了**第二题**，
++    于是照着第二题点了第 1 个 —— 根子是「第一题时做的动作被用到了第二题上」。
++    真正执行前拿 stamp 跟当前屏幕比一次，不一样就不点。语音路径不盖戳
++    （stamp 为 None），此时不做拦截。
+     """
+     say(f"[小键盘] {number}")
+     started = time.monotonic()
+@@ -517,6 +538,12 @@ def handle_numpad(number, ctx):
+         say(f"[屏幕] {exc}")
+         return
+ 
++    # 核对「动作时戳」：这一下是在哪一屏按的？现在要点的又是哪一屏？
++    # 不一样就说明中间翻了页 —— 那这一下绝不能点（会点到新题目上）。
++    if stamp is not None and ScreenPrefetcher.signature(snap) != stamp:
++        say("[小键盘] 这一下已忽略：界面在按键之后翻页了（不点，免得点到新题上）")
++        return
++
+     if not snap.ok:
+         report_unusable_screen(snap)
+         return
+@@ -794,16 +821,20 @@ def main(argv=None):
+     def numpad_worker():
+         while not worker_stop.is_set():
+             try:
+-                number = numpad_queue.get(timeout=0.2)
++                action = numpad_queue.get(timeout=0.2)
+             except queue.Empty:
+                 continue
+             try:
+-                if number == ".":
+-                    handle_force_read(ctx)    # 小键盘 . = 强制重新读屏
+-                elif number == 0:
+-                    handle_next(ctx)          # 小键盘 0 = 下一题
++                kind, value, stamp = action
++            except (TypeError, ValueError):
++                continue
++            try:
++                if kind == "force_read":
++                    handle_force_read(ctx)
++                elif kind == "next":
++                    handle_next(ctx)
+                 else:
+-                    handle_numpad(number, ctx)
++                    handle_numpad(value, ctx, stamp=stamp)
+             except AdbError as exc:
+                 say(f"[!!] {exc}")
+             except Exception:  # noqa: BLE001
+@@ -826,9 +857,9 @@ def main(argv=None):
+ 
+     if not hotkeys.start(
+         on_toggle=toggle_mode,
+-        on_option=numpad_queue.put,
+-        on_next=lambda: numpad_queue.put(0),
+-        on_force_read=lambda: numpad_queue.put("."),
++        on_option=lambda n: numpad_queue.put(("numpad", n, ctx["prefetcher"].identity())),
++        on_next=lambda: numpad_queue.put(("next", None, ctx["prefetcher"].identity())),
++        on_force_read=lambda: numpad_queue.put(("force_read", None, None)),
+         on_toggle_voice=voice_toggle,
+     ) and mode == "hotkey":
+         say("      [注意] 热键不可用，先用常驻监听模式跑")
