@@ -1132,10 +1132,11 @@ def main(argv=None):
     # --- 界面（可选）
     # 开不开：命令行 --gui，或者 config.yaml 里 gui.enabled，二者取或。
     #
-    # 「界面能不能起来」在这里就问清楚 —— Tkinter 没装是最常见的失败，
-    # 而它会直接在 import 时抛出来。**界面起不来不该把程序拦在门外**
-    # （设计文档 §6 明说）：退回纯命令行继续跑，而不是让整个程序崩掉。
-    # 换句话说，不带 --gui 时这里一行都不会执行，行为与从前完全一致。
+    # 这里先尽早试一次 import：Tkinter 没装是最常见的失败，import 时就抛出来了。
+    # 但**import 成功不等于界面能起来** —— 没有显示器、Tk 初始化失败，都要等真正
+    # 开窗那一刻才知道。所以真正兜底的是下面主循环那**一整段**：无论哪种失败，
+    # 都打一句提示然后退回纯命令行继续跑（设计文档 §6），绝不把程序拦在门外。
+    # 换句话说，不带 --gui 时这两处一行都不会执行，行为与从前完全一致。
     use_gui = args.gui or cfg.gui.enabled
     gui = None
     if use_gui:
@@ -1248,13 +1249,26 @@ def main(argv=None):
         # 窗口位置存在 debug/gui_window.txt，**不写回 config.yaml** ——
         # pyyaml 回写会把那份逐行手写的注释全抹掉。
         window_file = debug_dir / "gui_window.txt"
-        loop_thread = threading.Thread(
-            target=run_voice_loop,
-            args=(ctx, hotkeys, recognizer),
-            kwargs={"once": args.once, "wake_event": wake_event},
-            daemon=True, name="voice-loop",
-        )
-        loop_thread.start()
+        loop_thread = None
+        # 「窗口是不是真的建出来了」。
+        # 它把两种结局分开：真 → 界面跑完了（正常关窗，或 Ctrl+C 打断），照常收尾退出；
+        # 假 → 界面压根起不来，落到下面去走那条不带界面的老路。
+        window_up = False
+
+        def start_voice_loop():
+            # 窗口建好之后才启动后台监听。放在这里而不是 gui.run() 之前，
+            # 为的是「界面起不来」时**没有**一条孤儿监听线程在跑 ——
+            # 否则退回命令行后会有两条循环同时抢着点。
+            nonlocal loop_thread, window_up
+            window_up = True
+            loop_thread = threading.Thread(
+                target=run_voice_loop,
+                args=(ctx, hotkeys, recognizer),
+                kwargs={"once": args.once, "wake_event": wake_event},
+                daemon=True, name="voice-loop",
+            )
+            loop_thread.start()
+
         try:
             gui.run(
                 # collect_state 是界面数据的唯一来源；界面按钮只是把意图名字
@@ -1272,20 +1286,41 @@ def main(argv=None):
                 # 按 ESC / 点界面上的「退出」都只是置位 quit_requested；
                 # 真正把窗口关掉、让 mainloop 返回，靠界面轮询这个回调。
                 should_close=lambda: hotkeys.quit_requested.is_set(),
+                on_window_ready=start_voice_loop,
             )
+        except Exception as exc:  # noqa: BLE001
+            # 设计文档 §6 的容错表：**界面起不来要退回纯命令行继续跑，不能因此起不来。**
+            # 只兜 import 是不够的 —— 没有显示器、Tk 初始化报错，都要等真正开窗才抛出来。
+            say(f"  [注意] 界面起不来（{type(exc).__name__}: {exc}），"
+                f"退回纯命令行模式继续跑")
+            # 界面没了，界面状态也别再攒了（谁都不看，白白占内存）
+            ctx["ui"] = None
+            if window_up:
+                # 罕见情况：窗口开起来之后才倒的。后台监听可能已经在跑 —— 先叫停它，
+                # 并把退出标记**复位**；不复位的话下面那条老路刚进去就退出了。
+                hotkeys.quit_requested.set()
+                if loop_thread is not None:
+                    loop_thread.join(timeout=3)
+                hotkeys.quit_requested.clear()
+                # 置回假，免得下面 finally 又把它当「正常退出」收一遍尾
+                window_up = False
         finally:
-            # 关窗口 = 退出请求（on_closed 里已经置过一次）。这里再置一次是兜底：
-            # 万一 mainloop 是被别的方式结束的，监听线程也得跟着停下来。
-            hotkeys.quit_requested.set()
-            loop_thread.join(timeout=3)
-            worker_stop.set()
-            hotkeys.stop()
-            recognizer.close()
+            if window_up:
+                # 关窗口 = 退出请求（on_closed 里已经置过一次）。这里再置一次是兜底：
+                # 万一 mainloop 是被别的方式结束的（比如 Ctrl+C），监听线程也得跟着停下来。
+                hotkeys.quit_requested.set()
+                if loop_thread is not None:
+                    loop_thread.join(timeout=3)
+                worker_stop.set()
+                hotkeys.stop()
+                recognizer.close()
 
-        say()
-        say("  已退出。")
-        say()
-        return 0
+        if window_up:
+            say()
+            say("  已退出。")
+            say()
+            return 0
+        # 落到这里 = 界面起不来 —— 照常走下面那条不带界面的老路。
 
     try:
         run_voice_loop(ctx, hotkeys, recognizer, once=args.once)

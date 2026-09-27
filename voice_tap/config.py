@@ -195,6 +195,33 @@ class Config:
 TRUE_WORDS = {"true", "yes", "on", "1", "是", "开", "打开", "启用"}
 FALSE_WORDS = {"false", "no", "off", "0", "否", "关", "关闭", "禁用"}
 
+# 界面刷新间隔的下限（毫秒）。
+# `root.after(0, ...)` 是**忙循环**：每次刷新完立刻又排一次，主线程被界面占死，
+# 听语音那条线程也跟着挨饿。所以比这个数还小的值一律抬上来。
+MIN_GUI_REFRESH_MS = 30
+
+
+def _section(data: dict, key: str, notices) -> dict:
+    """
+    取一个顶层配置段（audio / asr / … / gui）。
+
+    段的值**必须是映射**。YAML 里手滑写成 `gui: 3` / `hotkey: 3` / `match: true`
+    这种非映射值，后面随手的 `.get(...)` 就会抛 AttributeError，
+    整个 `load_config` 当场崩 —— **连不带 `--gui` 的正常路径都起不来**。
+    这与本模块的根本原则直接冲突，所以在这里统一兜住：退回空字典（该段全部用默认值），
+    并留一句提示 —— 不然用户那一整段配置白写了都不知道。
+
+    键不存在（或显式 null）时保持**静默**，和 `_pick` 一贯的行为一致。
+    """
+    value = data.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        notices.append(f"config.yaml 的 {key} 段不是一个配置段（{value!r}），"
+                       f"该段全部使用默认值")
+        return {}
+    return value
+
 
 def _to_bool(value):
     """比内置 bool() 靠谱：能正确理解 'false' 'no' '关' 这类写法"""
@@ -272,6 +299,20 @@ def _to_window(value, default, notices):
         return default
 
 
+def _to_refresh_ms(value, notices):
+    """
+    界面刷新间隔（毫秒）。太小会变成忙循环，一律抬到下限。
+
+    非数字的坏值在 `_pick` 那层就已经退默认值了，到不了这里 ——
+    这里只管「是数字但小得离谱」（0、负数、个位数）。
+    """
+    if value < MIN_GUI_REFRESH_MS:
+        notices.append(f"config.yaml 的 gui.refresh_ms 太小（{value}），"
+                       f"刷新会变成忙循环，改用 {MIN_GUI_REFRESH_MS}")
+        return MIN_GUI_REFRESH_MS
+    return value
+
+
 def _pick(section: dict, key: str, default, caster, notices, where: str):
     """
     从一个分组里取一个键。任何异常都退回默认值，绝不让配置问题挡住程序启动。
@@ -326,7 +367,7 @@ def load_config(path=None) -> Config:
 
     n = cfg.notices
 
-    a = data.get("audio") or {}
+    a = _section(data, "audio", n)
     cfg.audio = AudioConfig(
         input_device=_pick(a, "input_device", AudioConfig.input_device, int, n, "audio"),
         samplerate=_pick(a, "samplerate", AudioConfig.samplerate, int, n, "audio"),
@@ -335,7 +376,7 @@ def load_config(path=None) -> Config:
         max_utterance=_pick(a, "max_utterance", AudioConfig.max_utterance, float, n, "audio"),
     )
 
-    s = data.get("asr") or {}
+    s = _section(data, "asr", n)
     cfg.asr = AsrConfig(
         model=_pick(s, "model", AsrConfig.model, str, n, "asr"),
         language=_pick(s, "language", AsrConfig.language, str, n, "asr"),
@@ -346,7 +387,7 @@ def load_config(path=None) -> Config:
         use_screen_hint=_pick(s, "use_screen_hint", AsrConfig.use_screen_hint, _to_bool, n, "asr"),
     )
 
-    m = data.get("match") or {}
+    m = _section(data, "match", n)
     cfg.match = MatchConfig(
         fuzzy_enabled=_pick(m, "fuzzy_enabled", MatchConfig.fuzzy_enabled, _to_bool, n, "match"),
         max_distance=_pick(m, "max_distance", MatchConfig.max_distance, int, n, "match"),
@@ -354,13 +395,13 @@ def load_config(path=None) -> Config:
         min_substring_length=_pick(m, "min_substring_length", MatchConfig.min_substring_length, int, n, "match"),
     )
 
-    c = data.get("click") or {}
+    c = _section(data, "click", n)
     cfg.click = ClickConfig(
         debounce_ms=_pick(c, "debounce_ms", ClickConfig.debounce_ms, int, n, "click"),
         settle_ms=_pick(c, "settle_ms", ClickConfig.settle_ms, int, n, "click"),
     )
 
-    h = data.get("hotkey") or {}
+    h = _section(data, "hotkey", n)
     cfg.hotkey = HotkeyConfig(
         push_to_talk=_pick(h, "push_to_talk", HotkeyConfig.push_to_talk, str, n, "hotkey"),
         toggle_mode=_pick(h, "toggle_mode", HotkeyConfig.toggle_mode, str, n, "hotkey"),
@@ -371,7 +412,7 @@ def load_config(path=None) -> Config:
         fixed_next_position=_to_position(h.get("fixed_next_position")),
     )
 
-    v = data.get("voice") or {}
+    v = _section(data, "voice", n)
     cfg.voice = VoiceConfig(
         mute_after_click_ms=_pick(v, "mute_after_click_ms", VoiceConfig.mute_after_click_ms,
                                   int, n, "voice"),
@@ -379,14 +420,14 @@ def load_config(path=None) -> Config:
         next_command=_pick(v, "next_command", VoiceConfig.next_command, _to_bool, n, "voice"),
     )
 
-    r = data.get("run") or {}
+    r = _section(data, "run", n)
     cfg.run = RunConfig(
         default_mode=_pick(r, "default_mode", RunConfig.default_mode, str, n, "run"),
         preview=_pick(r, "preview", RunConfig.preview, _to_bool, n, "run"),
         sound=_pick(r, "sound", RunConfig.sound, _to_bool, n, "run"),
     )
 
-    pf = data.get("prefetch") or {}
+    pf = _section(data, "prefetch", n)
     cfg.prefetch = PrefetchConfig(
         on_speech=_pick(pf, "on_speech", PrefetchConfig.on_speech, _to_bool, n, "prefetch"),
         after_click=_pick(pf, "after_click", PrefetchConfig.after_click, _to_bool, n, "prefetch"),
@@ -397,12 +438,16 @@ def load_config(path=None) -> Config:
         cache_max_age=_pick(pf, "cache_max_age", PrefetchConfig.cache_max_age, float, n, "prefetch"),
     )
 
-    gt = data.get("gui") or {}
+    gt = _section(data, "gui", n)
     cfg.gui = GuiConfig(
         enabled=_pick(gt, "enabled", GuiConfig.enabled, _to_bool, n, "gui"),
-        window=_to_window(gt.get("window"), GuiConfig.window, n),
+        # 键不存在时静默用默认值（和 _pick 一样）。以前是 `gt.get("window")`，
+        # 段不存在时拿到 None，被 _to_window 当成坏值白报一条「window 不是四个数」。
+        window=(_to_window(gt["window"], GuiConfig.window, n)
+                if "window" in gt else GuiConfig.window),
         topmost=_pick(gt, "topmost", GuiConfig.topmost, _to_bool, n, "gui"),
-        refresh_ms=_pick(gt, "refresh_ms", GuiConfig.refresh_ms, int, n, "gui"),
+        refresh_ms=_to_refresh_ms(
+            _pick(gt, "refresh_ms", GuiConfig.refresh_ms, int, n, "gui"), n),
     )
 
     if cfg.run.default_mode not in ("listen", "hotkey"):

@@ -10,7 +10,7 @@ ui_state.py 和 main.py 的函数里 —— 那边可以用普通测试完整覆
 薄到「看一眼就知道没写错」的程度。
 
 本模块**只在 --gui（或配置里开了界面）时才会被 import** —— 顶层 import tkinter，
-没装 Tkinter 的机器不该因为一个界面而起不来（main.py 里兜住了 ImportError）。
+没装 Tkinter 的机器不该因为一个界面而起不来（main.py 里整段兜住了）。
 """
 
 from __future__ import annotations
@@ -174,7 +174,7 @@ class AppWindow:
 
 
 def run(collect_state, on_intent, refresh_ms=150, topmost=True,
-        geometry=None, on_closed=None, should_close=None):
+        geometry=None, on_closed=None, should_close=None, on_window_ready=None):
     """
     开窗并进入 Tk 事件循环。**必须在主线程调用。**
 
@@ -184,6 +184,10 @@ def run(collect_state, on_intent, refresh_ms=150, topmost=True,
     就把窗口关掉。按 ESC、点界面上的「退出」都只是把退出请求置位，
     **不靠这个轮询的话没人去 destroy 根窗口**，mainloop 就永远不返回、
     进程也结束不了。三条退出路（ESC／退出按钮／窗口 X）最终都汇到 close()。
+
+    on_window_ready 在窗口**已经建好、就差进事件循环**那一瞬间被调一次。
+    给 main 用来启动「后台听语音」那条线程：窗口建不出来时会在它之前就抛异常，
+    于是那条线程压根不会启动 —— 退回命令行时就不会有两条循环在抢。
     """
     root = tk.Tk()
     if geometry:
@@ -193,4 +197,6 @@ def run(collect_state, on_intent, refresh_ms=150, topmost=True,
                        on_closed=on_closed, should_close=should_close)
 
     root.protocol("WM_DELETE_WINDOW", window.close)
+    if on_window_ready is not None:
+        on_window_ready()
     root.mainloop()

@@ -27,7 +27,10 @@ import unittest
 # 数字只增不减 —— 低于基线说明有测试消失了，要么找回来，要么在这里写下理由。
 BASELINE_COUNTS = {
     "tests.test_audio": 19,
-    "tests.test_config": 17,
+    # 17 → 34：补上 gui.* 解析与「配置段写歪不能把程序拦在门外」两批用例
+    # （TestGuiConfig / TestNonMappingSections）。基线贴着实际值，
+    # 免得整类被删掉时用例数还高于基线、单靠数字发现不了。
+    "tests.test_config": 34,
     "tests.test_hotkey": 25,
     "tests.test_matcher": 51,
     "tests.test_pipeline": 59,
@@ -58,6 +61,9 @@ REQUIRED_CLASSES = {
         "TestHandleIntent",                # 界面按钮与热键走同一份代码
         "TestToggleFlag",                  # 界面上的预读／语音下一题开关
         "TestAnyEvent",                    # 退出请求与唤醒合成一个中断源
+        # 整个类删掉时用例数仍高于基线（现在远超 59），单靠数字发现不了 ——
+        # 而它钉的是「窗口位置存了能读回来」这件只有真机才验得了的事。
+        "TestWindowGeometry",              # 窗口几何的存／读／坏值兜底
     ],
     "tests.test_screen": [
         "TestForegroundGuard",             # 前台应用护栏
