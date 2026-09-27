@@ -245,7 +245,9 @@ python -m unittest discover -s tests
 **Interfaces**
 - Produces:
   - `matcher.NEXT_PHRASES: tuple[str, ...]`
-  - `matcher.detect_control(text: str) -> str | None` —— 目前只会返回 `"next"` 或 `None`
+  - `matcher.detect_control(text)` —— 目前只会返回 `"next"` 或 `None`
+    （**注意**：`matcher.py` 没有 `from __future__ import annotations`，所以**不要写 `-> str | None` 注解**，
+    那个写法在 Python 3.9 会直接报错。照步骤 3 给的代码片段写无注解版本。）
   - `VoiceConfig.next_command: bool = True`
   - `handle_next(ctx, source="小键盘 0")` —— 新增 `source` 参数
 
