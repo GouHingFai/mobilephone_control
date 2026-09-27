@@ -542,6 +542,67 @@ def _toggle_flag(ctx, section, key, label):
     say(f"  >>> {label}：{'开' if getattr(obj, key) else '关'}")
 
 
+# 识别语言的三档与它们的中文名。
+#
+# `None` 是「让模型自己判断」（配置里的默认值），界面上写作「自动」。
+# 轮转的规则（自动 → 中文 → 英文 → 自动）**只在这个模块里**，
+# 界面上那个按钮不碰 —— 它只负责把点击变成 `"cycle_language"` 这个意图名。
+_LANGUAGE_CYCLE = (None, "zh", "en")
+_LANGUAGE_NAMES = {None: "自动", "zh": "中文", "en": "英文"}
+
+
+def _language_label(language):
+    """把配置里的语言值翻成界面上写的中文名（不认识的照原样显示）"""
+    return _LANGUAGE_NAMES.get(language, language)
+
+
+def cycle_language(ctx):
+    """
+    识别语言按 自动(None) → 中文(zh) → 英文(en) → 自动 轮转，每次打一行日志。
+
+    改成什么不影响正在跑的那句话：识别器每句都现读 `cfg.asr.language`
+    （见 asr.py），所以下一次说话就用新语言。
+    """
+    cfg = ctx["cfg"]
+    current = cfg.asr.language
+    try:
+        nxt = _LANGUAGE_CYCLE[(_LANGUAGE_CYCLE.index(current) + 1) % len(_LANGUAGE_CYCLE)]
+    except ValueError:
+        # 配置里写了个不认识的值（比如 "fr"）—— 从头开始轮转，别卡死
+        nxt = _LANGUAGE_CYCLE[0]
+    cfg.asr.language = nxt
+    say(f"  >>> 识别语言：{_language_label(nxt)}")
+    return nxt
+
+
+def control_intents(ctx):
+    """
+    界面上那些**与热键无关**的意图（点了就改配置，不需要另一套逻辑）。
+
+    单独抽成函数是为了让测试拿到**真接线**：测试若在别处把同样的 lambda
+    再抄一遍，就只测到了抄的那份，`main()` 里这张表改坏也发现不了 ——
+    而「界面点了没反应」正是这么来的。
+    """
+    return {
+        "toggle_prefetch": lambda: _toggle_flag(ctx, "prefetch", "after_click", "点击后预读"),
+        "toggle_voice_commands": lambda: _toggle_flag(ctx, "voice", "commands", "语音选择"),
+        "cycle_language": lambda: cycle_language(ctx),
+    }
+
+
+def unwired_intents(state, intents):
+    """
+    界面会发出、但意图表里没有的意图名。
+
+    界面按钮的全部行为就是「把意图名交出去」—— 表里没有就等于这个按钮是死的：
+    点下去、入队、查表查不到、静默返回，看不出任何异常。做成能单测的小函数，
+    由 `main()` 在启动时喊一声，免得又出现「界面每个按钮都点了没反应，测试全绿」。
+    """
+    names = {b["intent"] for row in state["controls"] for b in row}
+    names |= {b["intent"] for b in state["actions"]}
+    return sorted(names - set(intents))
+
+
 def handle_intent(name, ctx, wake_event=None):
     """
     执行一个来自界面的意图。
@@ -568,19 +629,70 @@ def collect_state(ctx):
 
     开关一律现读活对象（voice_gate / hotkeys / mode / 配置），不另存一份。
 
-    注意 `voice_next` 这个键名是**留给界面的历史名**：开关本身已并入
-    `cfg.voice.commands`（管「说序号」和「说下一题」两样）。键名先不动 ——
-    `gui.py` 认的是它，改名要跟界面一起改（界面留给任务 4）。
+    **「界面上有哪些按钮、每个按钮写什么、点一下发哪个意图名」全在这里拼好。**
+    这是刻意为之的结构（2026-09-28 定的）：以前这些知识散在两边 ——
+    这里决定有哪些键、`gui.py` 里硬写着键名和标签。上回入队格式改成二元组、
+    `gui.py` 那边的键名没跟上，结果**界面上每个按钮都点了没反应，而测试全绿**
+    （`gui.py` 要 import tkinter，沙箱测不了，没有用例能同时盖住两边）。
+
+    现在 `gui.py` 只做一件事：照着 `controls` / `actions` 摆控件，
+    点一下就把 `intent` 交出去。于是「界面显示什么」整个落在这个**能单测**的函数里，
+    `gui.py` 就算写错也错不出花来。
+
+    返回的按钮形状：
+
+        {"intent": 意图名, "text": 完整按钮文字（含快捷键后缀）, "on": 开/关}
+
+    - `text` 里带不带快捷键由这里决定：有对应热键的（语音/模式/小键盘/退出）带上，
+      没有的（点击后预读、语音选择、识别语言）不带。
+    - 快捷键名从 `cfg.hotkey` 现取，**不写死** —— 配置改了界面就跟着改。
+    - `on` 是给渲染用的状态（`cycle_language` 这类不是开关的给 `None`）；
+      文字里已经含了开/关，`on` 留给界面做视觉提示用。
     """
+    cfg = ctx["cfg"]
+    hotkey = cfg.hotkey
     ui = ctx.get("ui")
+    mode = ctx["mode"]
+
+    def button(intent, text, on=None):
+        return {"intent": intent, "text": text, "on": on}
+
     return {
-        "toggles": {
-            "voice": ctx["voice_gate"].enabled,
-            "mode": ctx["mode"],
-            "numpad": ctx["hotkeys"].numpad_enabled,
-            "prefetch": ctx["cfg"].prefetch.after_click,
-            "voice_next": ctx["cfg"].voice.commands,
-        },
+        # 第一行：三个**有热键**的开关（用户在界面上就能看到该按哪个键）
+        "controls": [
+            [
+                button("toggle_voice",
+                       f"语音 {hotkey.toggle_voice.upper()}："
+                       f"{'开' if ctx['voice_gate'].enabled else '关'}",
+                       on=ctx["voice_gate"].enabled),
+                # 模式按钮显示的是「当前是哪种模式」，不是开/关
+                button("toggle_mode",
+                       f"{'按住说话' if mode == 'hotkey' else '常驻监听'} "
+                       f"{hotkey.toggle_mode.upper()}",
+                       on=(mode == "hotkey")),
+                button("toggle_numpad",
+                       f"小键盘 {hotkey.toggle_numpad.upper()}："
+                       f"{'开' if ctx['hotkeys'].numpad_enabled else '关'}",
+                       on=ctx["hotkeys"].numpad_enabled),
+            ],
+            # 第二行：三个**没有热键**的（点击后预读、语音选择、识别语言）——
+            # 「如果没有快捷键的就不用列」。
+            [
+                button("toggle_prefetch",
+                       f"点击后预读：{'开' if cfg.prefetch.after_click else '关'}",
+                       on=cfg.prefetch.after_click),
+                button("toggle_voice_commands",
+                       f"语音选择：{'开' if cfg.voice.commands else '关'}",
+                       on=cfg.voice.commands),
+                button("cycle_language",
+                       f"识别语言：{_language_label(cfg.asr.language)}"),
+            ],
+        ],
+        # 底部一排（靠左摆，不参与上面的等宽网格）。退出标出 ESC。
+        "actions": [
+            button("force_read", "强制重新读屏"),
+            button("quit", "退出 ESC"),
+        ],
         "screen": ui.current_screen() if ui else None,
         "inputs": ui.recent_inputs() if ui else [],
     }
@@ -1254,13 +1366,19 @@ def main(argv=None):
         "toggle_voice": voice_toggle,
         "toggle_mode": toggle_mode,
         "toggle_numpad": lambda: hotkeys.set_numpad(not hotkeys.numpad_enabled),
-        "toggle_prefetch": lambda: _toggle_flag(ctx, "prefetch", "after_click", "点击后预读"),
-        # 意图名先保持 `toggle_voice_next`（界面认的是它，改名要跟界面一起改）。
-        # 它翻的是合并后的 `voice.commands` —— 管「说序号」+「说下一题」。
-        "toggle_voice_next": lambda: _toggle_flag(ctx, "voice", "commands", "语音说序号/下一题"),
+        # 与热键无关的那几个（预读 / 语音选择 / 识别语言）收在 control_intents 里，
+        # 这样测试能拿到**真接线**，不必在测试里把同一段 lambda 再抄一遍。
+        **control_intents(ctx),
         "force_read": lambda: handle_force_read(ctx),
         "quit": lambda: hotkeys.quit_requested.set(),
     }
+
+    # 界面发出来的意图名，必须都能在这张表里找到 —— 找不到的那个按钮点了不会有反应。
+    # 上回「入队格式改了、界面键名没跟上」就是这个病：界面在喊，没人接，而测试全绿。
+    missing = unwired_intents(collect_state(ctx), ctx["intents"])
+    if missing:
+        say(f"  [!!] 界面按钮指向了意图表里没有的名字：{'、'.join(missing)}"
+            f" —— 这几个按钮点了不会有任何反应")
 
     # 三个按键回调：按键那一刻就把动作入队，交给工作线程执行。
     putters = make_action_putters(numpad_queue, ctx["prefetcher"])

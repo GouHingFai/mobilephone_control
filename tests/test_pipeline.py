@@ -67,6 +67,17 @@ DETAIL_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
 INFER_FROM_XML = object()
 
 
+def buttons_by_intent(state):
+    """
+    把 `collect_state` 给的控件数据摊平成 `{意图名: 按钮字典}`。
+
+    界面拿到的就是这样一串「意图名 + 完整文字」（见 `collect_state`），
+    断言按意图名取最省事，也最贴近界面那边真正的用法。
+    """
+    buttons = [b for row in state["controls"] for b in row] + list(state["actions"])
+    return {b["intent"]: b for b in buttons}
+
+
 class FakeAdb:
     """顶替真机：dump 返回固定 XML，tap 只记录不执行"""
 
@@ -1482,6 +1493,34 @@ class TestHandleIntent(unittest.TestCase):
 
         self.assertTrue(wake.is_set(), "执行完要唤醒监听线程，开关才会立刻生效")
 
+    def test_voice_commands_intent_flips_the_real_switch(self):
+        """
+        「语音选择」按钮走**真接线**：`control_intents` 里那条名字 → 翻 `cfg.voice.commands`。
+
+        这里**不自己另抄一份 lambda**（抄一份就只测了抄的那份，测不到 main() 里那张表）。
+        名字或行为哪个对不上，这条当场就红 —— 这正是「界面点了没反应」的护栏。
+        """
+        ctx = {"cfg": Config()}
+        ctx["intents"] = app.control_intents(ctx)
+
+        app.handle_intent("toggle_voice_commands", ctx)
+        self.assertTrue(ctx["cfg"].voice.commands, "点一下应当打开语音说序号/下一题")
+
+        app.handle_intent("toggle_voice_commands", ctx)
+        self.assertFalse(ctx["cfg"].voice.commands, "再点一下应当关回去")
+
+    def test_cycle_language_intent_rotates_auto_zh_en(self):
+        """识别语言按 自动(None) → 中文(zh) → 英文(en) → 自动 轮转（规则在 main.py）"""
+        ctx = {"cfg": Config()}
+        ctx["intents"] = app.control_intents(ctx)
+
+        seen = []
+        for _ in range(3):
+            app.handle_intent("cycle_language", ctx)
+            seen.append(ctx["cfg"].asr.language)
+
+        self.assertEqual(seen, ["zh", "en", None])
+
 
 class TestToggleFlag(unittest.TestCase):
     """界面上那两个没有对应热键的开关（预读、语音下一题）"""
@@ -1523,6 +1562,10 @@ class TestCollectState(unittest.TestCase):
 
     开关的真相源是那些活对象，这里现读 —— 不另存一份，
     否则会出现「界面显示开着、实际没开」的分裂。
+
+    「界面上有哪些按钮、每个按钮写什么、点一下发哪个意图名」**全在这里拼好**，
+    `gui.py` 只是照着数据摆控件、点一下把意图名交出去 ——
+    界面那边不再认键名、认标签、认快捷键，也就不存在「两边没一起改」的病。
     """
 
     def _ctx(self):
@@ -1538,27 +1581,114 @@ class TestCollectState(unittest.TestCase):
             "ui": UiState(),
         }
 
+    # ---------------------------------------------------------- 开关状态
+
     def test_reports_live_toggles(self):
         ctx = self._ctx()
         # 语音控制开关默认关；这里要验的是「现读活对象」，所以先把它打开
         ctx["cfg"].voice.commands = True
-        state = app.collect_state(ctx)
-        self.assertTrue(state["toggles"]["voice"])
-        self.assertEqual(state["toggles"]["mode"], "listen")
-        self.assertTrue(state["toggles"]["numpad"])
-        self.assertTrue(state["toggles"]["prefetch"])
-        self.assertTrue(state["toggles"]["voice_next"])
+        buttons = buttons_by_intent(app.collect_state(ctx))
+        self.assertTrue(buttons["toggle_voice"]["on"])
+        self.assertIn("开", buttons["toggle_voice"]["text"])
+        self.assertIn("常驻监听", buttons["toggle_mode"]["text"])
+        self.assertTrue(buttons["toggle_numpad"]["on"])
+        self.assertIn("开", buttons["toggle_numpad"]["text"])
+        self.assertTrue(buttons["toggle_prefetch"]["on"])
+        self.assertIn("开", buttons["toggle_prefetch"]["text"])
+        self.assertTrue(buttons["toggle_voice_commands"]["on"])
+        self.assertIn("开", buttons["toggle_voice_commands"]["text"])
 
     def test_voice_commands_toggle_defaults_off(self):
         """界面拿到的值必须跟着配置走 —— 默认关就要显示关"""
-        state = app.collect_state(self._ctx())
-        self.assertFalse(state["toggles"]["voice_next"],
+        buttons = buttons_by_intent(app.collect_state(self._ctx()))
+        self.assertFalse(buttons["toggle_voice_commands"]["on"],
                          "说序号/下一题合并后的开关默认关")
+        self.assertIn("关", buttons["toggle_voice_commands"]["text"])
 
     def test_reflects_changes_immediately(self):
         ctx = self._ctx()
         ctx["cfg"].prefetch.after_click = False
-        self.assertFalse(app.collect_state(ctx)["toggles"]["prefetch"])
+        buttons = buttons_by_intent(app.collect_state(ctx))
+        self.assertFalse(buttons["toggle_prefetch"]["on"])
+        self.assertIn("关", buttons["toggle_prefetch"]["text"])
+
+    def test_mode_button_shows_the_current_mode(self):
+        """模式那个按钮显示的是「当前是什么模式」，不是开/关"""
+        ctx = self._ctx()
+        buttons = buttons_by_intent(app.collect_state(ctx))
+        self.assertIn("常驻监听", buttons["toggle_mode"]["text"])
+
+        ctx["mode"] = "hotkey"
+        buttons = buttons_by_intent(app.collect_state(ctx))
+        self.assertIn("按住说话", buttons["toggle_mode"]["text"])
+
+    # ---------------------------------------------------------- 快捷键标注
+
+    def test_buttons_carry_their_hotkey_in_the_text(self):
+        """用户要求：每个有快捷键的按钮，文字里要看得见那个键"""
+        buttons = buttons_by_intent(app.collect_state(self._ctx()))
+        self.assertIn("F7", buttons["toggle_voice"]["text"])
+        self.assertIn("F9", buttons["toggle_mode"]["text"])
+        self.assertIn("F10", buttons["toggle_numpad"]["text"])
+        self.assertIn("ESC", buttons["quit"]["text"], "退出也该标出 ESC")
+
+    def test_hotkeys_come_from_config_not_hardcoded(self):
+        """快捷键从 `cfg.hotkey` 现取 —— 配置里改了，界面上就得跟着改。
+
+        这条守的是「别在 main.py 里把 f7/f9/f10 写死」：写死的话，
+        用户改了 config.yaml、界面却还标着旧键，等于骗人。
+        """
+        ctx = self._ctx()
+        ctx["cfg"].hotkey.toggle_voice = "f1"
+        ctx["cfg"].hotkey.toggle_mode = "f2"
+        ctx["cfg"].hotkey.toggle_numpad = "f3"
+
+        buttons = buttons_by_intent(app.collect_state(ctx))
+        self.assertIn("F1", buttons["toggle_voice"]["text"])
+        self.assertIn("F2", buttons["toggle_mode"]["text"])
+        self.assertIn("F3", buttons["toggle_numpad"]["text"])
+        self.assertNotIn("F7", buttons["toggle_voice"]["text"],
+                         "不该还写着配置里那个旧值")
+
+    def test_buttons_without_a_hotkey_have_no_suffix(self):
+        """没有快捷键的控件（点击后预读、语音选择、识别语言）不该带任何键名"""
+        buttons = buttons_by_intent(app.collect_state(self._ctx()))
+        for name in ("toggle_prefetch", "toggle_voice_commands", "cycle_language"):
+            for key in ("F7", "F8", "F9", "F10", "ESC"):
+                self.assertNotIn(key, buttons[name]["text"],
+                                 f"{name} 没有对应快捷键，不该出现 {key}")
+
+    def test_language_button_text_follows_the_current_language(self):
+        """识别语言那个按钮的文字要跟着当前语言变（自动 / 中文 / 英文）"""
+        ctx = self._ctx()
+
+        def text():
+            return buttons_by_intent(app.collect_state(ctx))["cycle_language"]["text"]
+
+        self.assertIn("自动", text(), "默认（None）应当显示「自动」")
+        ctx["cfg"].asr.language = "zh"
+        self.assertIn("中文", text())
+        ctx["cfg"].asr.language = "en"
+        self.assertIn("英文", text())
+
+    # ---------------------------------------------------------- 布局
+
+    def test_controls_are_two_rows_of_three(self):
+        """控制区是两行、每行三个 —— 布局由数据给出，不是写死在 gui.py 里"""
+        state = app.collect_state(self._ctx())
+        self.assertEqual([len(row) for row in state["controls"]], [3, 3])
+
+    def test_every_button_knows_its_intent(self):
+        """每个按钮都要带着意图名 —— 界面就靠这个名字把点击交出去"""
+        state = app.collect_state(self._ctx())
+        buttons = buttons_by_intent(state)
+        self.assertEqual(
+            set(buttons),
+            {"toggle_voice", "toggle_mode", "toggle_numpad", "toggle_prefetch",
+             "toggle_voice_commands", "cycle_language", "force_read", "quit"},
+        )
+        for name, button in buttons.items():
+            self.assertTrue(button["text"], f"{name} 的按钮文字不能是空的")
 
     def test_without_ui_returns_empty(self):
         ctx = self._ctx()
@@ -1566,6 +1696,30 @@ class TestCollectState(unittest.TestCase):
         state = app.collect_state(ctx)
         self.assertIsNone(state["screen"])
         self.assertEqual(state["inputs"], [])
+
+
+class TestUnwiredIntents(unittest.TestCase):
+    """
+    界面按钮的全部行为就是「把意图名交出去」，表里没有 = 这个按钮是死的。
+
+    上回就是这个病：入队格式改了、界面键名没跟上，界面每个按钮都点了没反应，
+    而测试全绿。这个函数让 main() 能当场把这种错喊出来。
+    """
+
+    def test_flags_a_name_the_table_forgot(self):
+        state = {"controls": [[{"intent": "toggle_voice"}, {"intent": "ghost"}]],
+                 "actions": []}
+        self.assertEqual(app.unwired_intents(state, {"toggle_voice": lambda: None}),
+                         ["ghost"])
+
+    def test_flags_names_in_the_bottom_row_too(self):
+        state = {"controls": [], "actions": [{"intent": "quit"}]}
+        self.assertEqual(app.unwired_intents(state, {}), ["quit"])
+
+    def test_empty_when_everything_is_wired(self):
+        state = {"controls": [[{"intent": "a"}, {"intent": "b"}]],
+                 "actions": [{"intent": "c"}]}
+        self.assertEqual(app.unwired_intents(state, {"a": 1, "b": 1, "c": 1}), [])
 
 
 class TestPublishScreen(unittest.TestCase):

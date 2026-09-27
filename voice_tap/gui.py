@@ -20,25 +20,14 @@ import tkinter as tk
 from tkinter import ttk
 
 
-# 界面上的开关按钮：名字（就是 main.ctx["intents"] 里的键）+ 中文标签。
-# 点一下就是把这个名字交给 on_intent —— 走的是与热键完全相同的那套回调。
-TOGGLE_LABELS = (
-    ("toggle_voice", "语音"),
-    ("toggle_mode", "模式"),
-    ("toggle_numpad", "小键盘"),
-    ("toggle_prefetch", "点击后预读"),
-    ("toggle_voice_next", "语音说下一题"),
-)
+def _intent_command(on_intent, name):
+    """
+    点一下按钮 = 把这个意图名交出去。**界面只认意图名，不认别的。**
 
-# 这五个开关**分两行**摆：前三个一行，后两个一行。
-#
-# 为什么不能一行排开：默认窗口宽 360 像素，而每个按钮 width=15 字符宽 ——
-# 一行五个的**请求宽度**远超窗口，后面几个会被挤掉、根本点不到。
-# （实测把这排按钮建在 360px 的窗口里：第三个「小键盘」被挤到 16 像素宽，
-#  「点击后预读」和「语音说下一题」各只剩 1 像素 —— 等于没有。）
-# 要命的是后两个（「点击后预读」「语音说下一题」）恰恰是**没有热键等价物**的
-# 两个（另外三个有 F7/F9/F10）—— 一旦被挤没，用户就没有别的办法打开它们。
-TOGGLE_ROWS = (TOGGLE_LABELS[:3], TOGGLE_LABELS[3:])
+    用工厂函数（而不是在循环里写 `lambda: ...`）是为了把名字钉进闭包，
+    免得所有按钮都捕获到循环结束时的那一个值。
+    """
+    return lambda: on_intent(name)
 
 
 class AppWindow:
@@ -51,7 +40,6 @@ class AppWindow:
         self.refresh_ms = refresh_ms
         self.on_closed = on_closed
         self.should_close = should_close
-        self._labels = dict(TOGGLE_LABELS)
         self._buttons = {}
 
         root.title("声控手机助手")
@@ -71,8 +59,8 @@ class AppWindow:
         """
         关窗前的收尾：先把窗口位置交出去存好，再销毁窗口。
 
-        **窗口 X 和 ESC/界面上的「退出」都走这一条路** —— 两条路都得存位置，
-        否则按 ESC 退出时那次的位置就白丢了。
+        **窗口 X、键盘上的退出键、界面上的退出按钮，三条路都汇到这里** ——
+        都得存位置，否则那一次的位置就白丢了。
         """
         if self.on_closed is not None:
             try:
@@ -85,37 +73,43 @@ class AppWindow:
     # -------------------------------------------------- 摆控件
 
     def _build(self):
+        # **这里的按钮、文字、意图名、快捷键、布局，全来自 collect_state 的数据。**
+        # 本文件里搜不到任何按钮标签、意图名、快捷键的字面量 —— 也就没有
+        # 「两边没一起改」这种病（上回入队格式改了就栽在这上面：界面每个按钮
+        # 都点了没反应，而 300+ 条测试全绿，因为这里要 import tkinter、测不了）。
+        state = self.collect_state()
         pad = {"padx": 6, "pady": 3}
 
         box = ttk.LabelFrame(self.root, text="控制")
         box.pack(fill="x", **pad)
         # 每行一个 Frame；行里的按钮用 grid 摆成**等宽列**（uniform）并 sticky="ew"。
         #
-        # 这样布局只取决于窗口宽度，跟按钮里的字多长无关：
-        #   第一行三个各占约 1/3 宽，第二行两个各占约 1/2 宽。
-        # 于是既不用一行塞五个（塞不下），也不会出现某个按钮被挤没。
+        # 这样布局只取决于窗口宽度，跟按钮里的字多长无关。于是既不会一行塞太多
+        # （塞不下），也不会出现某个按钮被挤没。
         #
-        # width 从 15 调到 8 —— 它在这里只是列宽的一个下限（约 80 像素），
-        # 真正的宽度由上面的等分决定，所以调小它不影响显示，只让「最窄列」更宽松。
-        # 实测（360×520 与最小 340×380 两种窗口）：每个按钮都 ≥96 像素，
-        # 最长的标签「语音说下一题：开」约 112 像素，尚有 ~1.34 倍余量。
-        for row_of in TOGGLE_ROWS:
+        # width 只是列宽的一个下限（真正的宽度由上面的等分决定），调小它不影响
+        # 显示，只让「最窄列」更宽松。
+        for row_buttons in state["controls"]:
             row = ttk.Frame(box)
             row.pack(fill="x")
-            for col in range(len(row_of)):
+            for col in range(len(row_buttons)):
                 row.columnconfigure(col, weight=1, uniform="toggle")
-            for col, (name, _label) in enumerate(row_of):
-                button = ttk.Button(row, text=name, width=8,
-                                    command=lambda n=name: self.on_intent(n))
+            for col, spec in enumerate(row_buttons):
+                button = ttk.Button(
+                    row, text=spec["text"], width=8,
+                    command=_intent_command(self.on_intent, spec["intent"]))
                 button.grid(row=0, column=col, sticky="ew", padx=6, pady=3)
-                self._buttons[name] = button
+                self._buttons[spec["intent"]] = button
 
+        # 底部一排：靠左、按自然宽度摆（不参与上面的等宽网格）。
         row = ttk.Frame(self.root)
         row.pack(fill="x", **pad)
-        ttk.Button(row, text="强制重新读屏",
-                   command=lambda: self.on_intent("force_read")).pack(side="left", **pad)
-        ttk.Button(row, text="退出",
-                   command=lambda: self.on_intent("quit")).pack(side="left", **pad)
+        for spec in state["actions"]:
+            button = ttk.Button(
+                row, text=spec["text"],
+                command=_intent_command(self.on_intent, spec["intent"]))
+            button.pack(side="left", **pad)
+            self._buttons[spec["intent"]] = button
 
         ttk.Label(self.root, text="程序读到的屏幕").pack(anchor="w", **pad)
         self._screen_box = self._make_text(height=10)
@@ -131,7 +125,7 @@ class AppWindow:
     # -------------------------------------------------- 刷新
 
     def _tick(self):
-        # ESC 和界面上的「退出」都只是把 quit_requested 置了个位；
+        # 键盘上的退出键和界面上的退出按钮都只是把退出请求置了个位；
         # 主线程正卡在 mainloop() 里，没人叫停它窗口就干留着、进程也吊着。
         # 所以每次刷新前问一句「要不要关」，要关就走和窗口 X 相同的那条收尾路。
         if self.should_close is not None and self.should_close():
@@ -144,25 +138,23 @@ class AppWindow:
 
     def refresh(self):
         state = self.collect_state()
-        self._render_toggles(state["toggles"])
+        self._render_buttons(state)
         self._set_text(self._screen_box, self._render_screen(state["screen"]))
         self._set_text(self._input_box, self._render_inputs(state["inputs"]))
 
-    def _render_toggles(self, toggles):
-        on = {
-            "toggle_voice": toggles["voice"],
-            "toggle_mode": toggles["mode"] == "hotkey",
-            "toggle_numpad": toggles["numpad"],
-            "toggle_prefetch": toggles["prefetch"],
-            "toggle_voice_next": toggles["voice_next"],
-        }
-        self._buttons["toggle_mode"].config(
-            text="按住说话" if on["toggle_mode"] else "常驻监听")
-        for name, value in on.items():
-            if name == "toggle_mode":
-                continue
-            self._buttons[name].config(
-                text=f"{self._labels[name]}：{'开' if value else '关'}")
+    def _render_buttons(self, state):
+        # 文字是 collect_state 拼好的（含快捷键后缀、开/关、当前模式、当前语言），
+        # 这里只负责贴上去 —— 不含任何判断。
+        for row_buttons in state["controls"]:
+            for spec in row_buttons:
+                self._apply_button(spec)
+        for spec in state["actions"]:
+            self._apply_button(spec)
+
+    def _apply_button(self, spec):
+        button = self._buttons.get(spec["intent"])
+        if button is not None:
+            button.config(text=spec["text"])
 
     @staticmethod
     def _render_screen(view):
@@ -206,12 +198,12 @@ def run(collect_state, on_intent, refresh_ms=150, topmost=True,
     on_closed 会在窗口关闭时收到当前几何位置（(x, y, 宽, 高)）。
 
     should_close 是个无参可调用对象：界面每次刷新时问它一次，一旦返回真值
-    就把窗口关掉。按 ESC、点界面上的「退出」都只是把退出请求置位，
+    就把窗口关掉。键盘上的退出键、点界面上的退出按钮都只是把退出请求置位，
     **不靠这个轮询的话没人去 destroy 根窗口**，mainloop 就永远不返回、
-    进程也结束不了。三条退出路（ESC／退出按钮／窗口 X）最终都汇到 close()。
+    进程也结束不了。三条退出路（键盘／界面按钮／窗口 X）最终都汇到 close()。
 
     on_window_ready 在窗口**已经建好、就差进事件循环**那一瞬间被调一次。
-    给 main 用来启动「后台听语音」那条线程：窗口建不出来时会在它之前就抛异常，
+    给 main 用来启动「后台听声音」那条线程：窗口建不出来时会在它之前就抛异常，
     于是那条线程压根不会启动 —— 退回命令行时就不会有两条循环在抢。
     """
     root = tk.Tk()
