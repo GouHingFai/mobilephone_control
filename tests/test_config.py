@@ -144,18 +144,36 @@ class TestVoiceMuteDuration(unittest.TestCase):
             "若是你有意改的，请同步改这个测试并注明理由")
 
 
-class TestVoiceNextCommand(unittest.TestCase):
+class TestVoiceCommandsSwitch(unittest.TestCase):
+    """
+    说序号 / 说「下一题」的总开关，**默认关**。
 
-    def test_code_default_is_on(self):
-        self.assertTrue(cfgmod.VoiceConfig.next_command)
+    2026-09-28：`next_command`（原来默认 true）并入本开关，并且默认改成关。
+    依据真机日志：环境杂音或手机自己念出「第一个」，程序按序号点了一下。
+    序号（「1」「第二个」）和「下一题／继续」这类说法太容易误触发。
 
-    def test_shipped_config_is_on(self):
+    注意：**说单词来选选项那条路不受这个开关管** —— 那是用户语音的主力用法。
+    """
+
+    def test_default_is_off(self):
+        self.assertFalse(cfgmod.VoiceConfig.commands)
+
+    def test_shipped_config_is_off(self):
         real = Path(__file__).resolve().parent.parent / "config.yaml"
-        self.assertTrue(cfgmod.load_config(real).voice.next_command)
+        self.assertFalse(cfgmod.load_config(real).voice.commands)
+
+    def test_parsed_on(self):
+        cfg = load_yaml("voice:\n  commands: 开\n")
+        self.assertTrue(cfg.voice.commands)
 
     def test_parsed_off(self):
-        cfg = load_yaml("voice:\n  next_command: 关\n")
-        self.assertFalse(cfg.voice.next_command)
+        """显式写关也要认（默认就是关，但配置里写死一个关值不能被解析歪）"""
+        cfg = load_yaml("voice:\n  commands: 关\n")
+        self.assertFalse(cfg.voice.commands)
+
+    def test_old_key_is_gone(self):
+        """`next_command` 已并入 `commands`，留着是残留引用"""
+        self.assertFalse(hasattr(cfgmod.VoiceConfig, "next_command"))
 
 
 class TestNonMappingSections(unittest.TestCase):

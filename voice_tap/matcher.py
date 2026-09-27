@@ -314,12 +314,17 @@ def _coverage(spoken_key: str, option_key: str) -> float:
     return len(spoken_key) / len(option_key)
 
 
-def match(spoken: str, options, cfg=None) -> MatchResult:
+def match(spoken: str, options, cfg=None, allow_ordinal: bool = True) -> MatchResult:
     """
     把 spoken 匹配到 options 里的某一项。
 
     options 是 screen.Node 的列表（只要有 .text 属性即可）。
     cfg 需要 match.MinSubstring 相关字段，传 None 用默认值。
+
+    allow_ordinal=False 时**不走「说序号」那条路**（「1」「第二个」不再按
+    序号命中，会照常落回下面的文字匹配）。这是给 `voice.commands` 开关用的：
+    序号说法太容易被环境杂音误触发（真机日志里有过一次杂音说「第一个」就点了一下）。
+    **默认 True，老调用方的行为不变。**
     """
     result = MatchResult(spoken=spoken)
 
@@ -362,18 +367,22 @@ def match(spoken: str, options, cfg=None) -> MatchResult:
     # 「1」「第一个」是最明确的意图，比任何文字匹配都可信，所以放在最前面。
     # 但如果说的序号超出了选项数量，就落下去继续试文字匹配
     # （万一选项文字里真有个数字），最后再把「超出范围」这件事报给上层。
-    ordinal = parse_ordinal(spoken)
-    if ordinal is not None:
-        index = len(prepared) if ordinal == ORDINAL_LAST else ordinal
-        if 1 <= index <= len(prepared):
-            node = prepared[index - 1]["node"]
-            result.node = node
-            result.level = LEVEL_ORDINAL
-            result.candidates = [node]
-            result.by_ordinal = True
-            result.ordinal_index = index
-            return result
-        result.ordinal_out_of_range = ordinal
+    #
+    # 整段由 allow_ordinal 控制：关掉时**整个跳过**（连「超出范围」都不记），
+    # 直接落回下面的文字匹配 —— 也就是「1」被当成普通文字处理。
+    if allow_ordinal:
+        ordinal = parse_ordinal(spoken)
+        if ordinal is not None:
+            index = len(prepared) if ordinal == ORDINAL_LAST else ordinal
+            if 1 <= index <= len(prepared):
+                node = prepared[index - 1]["node"]
+                result.node = node
+                result.level = LEVEL_ORDINAL
+                result.candidates = [node]
+                result.by_ordinal = True
+                result.ordinal_index = index
+                return result
+            result.ordinal_out_of_range = ordinal
 
     buckets = {level: [] for level in
                (LEVEL_EXACT, LEVEL_SUBSTRING, LEVEL_CONTAINS,

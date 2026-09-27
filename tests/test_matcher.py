@@ -380,6 +380,48 @@ class TestOrdinalMatch(unittest.TestCase):
                 self.assertEqual(matcher.parse_ordinal(text), matcher.ORDINAL_LAST)
 
 
+class TestOrdinalCanBeDisabled(unittest.TestCase):
+    """
+    说序号这条路可以被关掉。
+
+    依据真机日志：出现过一次 `[听到] '第一个'`（语言还判成了 en）——
+    那是**环境杂音或手机自己念的**，结果按序号点了一下。
+    序号（「1」「第二个」）这类说法太容易误触发，所以给 `match()` 加了
+    `allow_ordinal`，由 `voice.commands` 开关控制，**默认关**。
+
+    注意：**说单词来选选项那条路不受这个开关管** —— 那是用户语音的主力用法。
+    """
+
+    def test_ordinal_works_by_default(self):
+        """不传 allow_ordinal 时行为不变（老调用方不该被这个改动影响）"""
+        opts = [FakeNode("alpha", y=1), FakeNode("beta", y=2)]
+        result = matcher.match("1", opts)
+        self.assertTrue(result.by_ordinal)
+
+    def test_ordinal_off_falls_through_to_text(self):
+        opts = [FakeNode("alpha", y=1), FakeNode("beta", y=2)]
+        result = matcher.match("1", opts, allow_ordinal=False)
+        self.assertFalse(result.by_ordinal, "关掉之后不该再按序号命中")
+        self.assertFalse(result.ok, "屏幕上没有「1」这个词，应当匹配不上（而不是乱点）")
+
+    def test_word_matching_is_unaffected(self):
+        """说单词选选项不受这个开关管（关掉序号之后，主力用法照常）"""
+        opts = real_options("gre_degrade.xml")
+        result = matcher.match("清晰", opts, CFG, allow_ordinal=False)
+        self.assertTrue(result.ok, "关掉序号不该连说单词也一起废掉")
+        self.assertFalse(result.by_ordinal)
+        self.assertEqual(result.level, matcher.LEVEL_SUBSTRING)
+
+    def test_chinese_ordinal_also_blocked(self):
+        """中文章法（「第二个」「最后一个」）和阿拉伯数字走同一道门"""
+        opts = real_options("gre_degrade.xml")
+        for spoken in ("第二个", "最后一个", "我选第五个"):
+            with self.subTest(spoken=spoken):
+                result = matcher.match(spoken, opts, CFG, allow_ordinal=False)
+                self.assertFalse(result.by_ordinal, f"{spoken!r} 关掉后不该按序号命中")
+                self.assertFalse(result.ok, f"{spoken!r} 关掉后应当匹配不上")
+
+
 class TestStemMatch(unittest.TestCase):
     """
     英语词形匹配。这一级是看了真机日志才加的。

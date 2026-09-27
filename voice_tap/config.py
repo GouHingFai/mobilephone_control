@@ -106,11 +106,18 @@ class VoiceConfig:
     # 启动时语音是否开启（运行中按 F7 可以随时开关）
     enabled: bool = True
 
-    # 允许说「下一题」翻页（答错进详情页后用它继续）。
+    # 语音控制语总开关：管「说序号」（「1」「第二个」「最后一个」）和
+    # 「说下一题／继续」这两类**一句话直接触发一个动作**的说法。
     #
-    # 注意这是**直给**：说了就点固定坐标，不读屏校验 ——
-    # 因此在答题页上误说也会点下去。这是用户明确选择的取舍。
-    next_command: bool = True
+    # 默认**关**。依据真机日志（debug/run_20260927_234859.log）：
+    # 出现过一次 `[听到] '第一个'`（语言还判成了 en）—— 那是**环境杂音或
+    # 手机自己念的**，结果程序按序号点了一下。序号和「下一题／继续」这类词
+    # 太短、太常见，环境里随便冒出一点声音就命中。
+    #
+    # 注意：**说单词来选选项那条路不受这个开关管** ——
+    # 那是用户语音的主力用法（用户列的要关的三项里没有它）。
+    # 关掉本开关后，「说选项里的词」照常工作。
+    commands: bool = False
 
 
 @dataclass
@@ -416,7 +423,7 @@ def load_config(path=None) -> Config:
         mute_after_click_ms=_pick(v, "mute_after_click_ms", VoiceConfig.mute_after_click_ms,
                                   int, n, "voice"),
         enabled=_pick(v, "enabled", VoiceConfig.enabled, _to_bool, n, "voice"),
-        next_command=_pick(v, "next_command", VoiceConfig.next_command, _to_bool, n, "voice"),
+        commands=_pick(v, "commands", VoiceConfig.commands, _to_bool, n, "voice"),
     )
 
     r = _section(data, "run", n)

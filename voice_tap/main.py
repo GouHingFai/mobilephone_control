@@ -567,6 +567,10 @@ def collect_state(ctx):
     拼一份「界面要显示的东西」。**只读，不改任何状态** —— 所以能单测。
 
     开关一律现读活对象（voice_gate / hotkeys / mode / 配置），不另存一份。
+
+    注意 `voice_next` 这个键名是**留给界面的历史名**：开关本身已并入
+    `cfg.voice.commands`（管「说序号」和「说下一题」两样）。键名先不动 ——
+    `gui.py` 认的是它，改名要跟界面一起改（界面留给任务 4）。
     """
     ui = ctx.get("ui")
     return {
@@ -575,7 +579,7 @@ def collect_state(ctx):
             "mode": ctx["mode"],
             "numpad": ctx["hotkeys"].numpad_enabled,
             "prefetch": ctx["cfg"].prefetch.after_click,
-            "voice_next": ctx["cfg"].voice.next_command,
+            "voice_next": ctx["cfg"].voice.commands,
         },
         "screen": ui.current_screen() if ui else None,
         "inputs": ui.recent_inputs() if ui else [],
@@ -764,7 +768,12 @@ def handle_speech(text, logprob, ctx):
 
     # 控制语优先，而且要排在取屏幕之前 —— 因为「下一题」走固定坐标，
     # 根本不需要读屏。说了就点，这是用户选的「直给」方式。
-    if ctx["cfg"].voice.next_command and matcher.detect_control(text) == "next":
+    #
+    # 这道门由 `voice.commands` 总开关控制（默认关）。它同时管下面那句
+    # 「说序号」（matcher.match 的 allow_ordinal）—— 两者都是「一句话直接
+    # 触发一个动作」，杂音里冒出「下一个」「继续」就会误点。
+    # **说单词选选项那条路不受它管。**
+    if ctx["cfg"].voice.commands and matcher.detect_control(text) == "next":
         handle_next(ctx, source="语音")
         return
 
@@ -781,7 +790,8 @@ def handle_speech(text, logprob, ctx):
     show_screen(snap)
     say(f"       （界面来源：{source}）")
 
-    result = matcher.match(text, snap.options, ctx["cfg"].match)
+    result = matcher.match(text, snap.options, ctx["cfg"].match,
+                           allow_ordinal=ctx["cfg"].voice.commands)
 
     if not result.ok:
         if result.ordinal_out_of_range:
@@ -1245,7 +1255,9 @@ def main(argv=None):
         "toggle_mode": toggle_mode,
         "toggle_numpad": lambda: hotkeys.set_numpad(not hotkeys.numpad_enabled),
         "toggle_prefetch": lambda: _toggle_flag(ctx, "prefetch", "after_click", "点击后预读"),
-        "toggle_voice_next": lambda: _toggle_flag(ctx, "voice", "next_command", "语音说「下一题」"),
+        # 意图名先保持 `toggle_voice_next`（界面认的是它，改名要跟界面一起改）。
+        # 它翻的是合并后的 `voice.commands` —— 管「说序号」+「说下一题」。
+        "toggle_voice_next": lambda: _toggle_flag(ctx, "voice", "commands", "语音说序号/下一题"),
         "force_read": lambda: handle_force_read(ctx),
         "quit": lambda: hotkeys.quit_requested.set(),
     }
@@ -1275,7 +1287,14 @@ def main(argv=None):
         say("  说出选项里的词（说一部分就行），说完稍微停一下即可。")
     else:
         say(f"  按住 {cfg.hotkey.push_to_talk.upper()} 说出选项里的词，松开即点。")
-    say("  也可以直接说序号：「1」「第二个」「最后一个」—— 生僻词听不准时用这个最稳。")
+    # 说序号 / 说「下一题」已合并成 voice.commands，且**默认关**。
+    # 这里必须跟着开关走 —— 不然默认配置下还在教用户说序号，说了却没反应。
+    if cfg.voice.commands:
+        say("  也可以直接说序号：「1」「第二个」「最后一个」—— 生僻词听不准时用这个最稳。")
+        say("  答错进详情页后，说「下一题」或「继续」可以翻页。")
+    else:
+        say("  （说序号、说「下一题」默认关着：这类短词容易被杂音误触发。"
+            "想用就在界面或 config.yaml 里打开 voice.commands。）")
     if hotkeys.numpad_enabled:
         say("  小键盘 1~9 点对应选项，0 点「下一题」，. 强制重新读屏（NumLock 要开着）。")
     say()

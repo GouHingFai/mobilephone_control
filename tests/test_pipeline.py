@@ -1100,7 +1100,14 @@ class TestActionWiring(unittest.TestCase):
 
 
 class TestVoiceNextCommand(unittest.TestCase):
-    """说「下一题」= 点下一题（直给：不读屏校验）"""
+    """
+    说「下一题」= 点下一题（直给：不读屏校验）。
+
+    2026-09-28：`voice.next_command` 并入 `voice.commands`，并且**默认关**。
+    这个开关同时管「说序号」那条路（见 tests/test_matcher.py 的
+    TestOrdinalCanBeDisabled）—— 因为两者都是「一句话直接触发一个动作」，
+    杂音里冒出「第一个」「继续」就会误点。
+    """
 
     def _ctx(self, xml):
         ctx, fake = make_ctx(xml)
@@ -1109,6 +1116,7 @@ class TestVoiceNextCommand(unittest.TestCase):
 
     def test_saying_next_clicks_the_button(self):
         ctx, fake = self._ctx(DETAIL_XML)
+        ctx["cfg"].voice.commands = True
 
         app.handle_speech("下一题", -0.4, ctx)
 
@@ -1118,18 +1126,54 @@ class TestVoiceNextCommand(unittest.TestCase):
     def test_works_on_quiz_page_too(self):
         """直给：答题页上说了照样点（用户明确接受这个取舍）"""
         ctx, fake = self._ctx(GRE_XML)
+        ctx["cfg"].voice.commands = True
 
         app.handle_speech("下一题", -0.4, ctx)
 
         self.assertEqual(fake.taps, [(909, 2476)])
 
     def test_disabled_by_config(self):
+        """开关关着时，说「下一题」不点（默认就是关 —— 这一条钉的是出厂行为）"""
         ctx, fake = self._ctx(DETAIL_XML)
-        ctx["cfg"].voice.next_command = False
 
         app.handle_speech("下一题", -0.4, ctx)
 
         self.assertEqual(fake.taps, [], "关掉之后不该点；应落回普通匹配并提示详情页")
+
+    def test_ordinal_disabled_by_config(self):
+        """
+        同一个开关也管「说序号」这条路。
+
+        这条钉的是 main 里的接线：`matcher.match(..., allow_ordinal=voice.commands)`。
+        只改 matcher 是不够的 —— 忘了传这个参数，「1」照样会点下去，
+        而 default 关的意图就落空了。
+        """
+        ctx, fake = make_ctx(GRE_XML)
+
+        app.handle_speech("3", -0.4, ctx)
+
+        self.assertEqual(fake.taps, [], "开关关着时，说序号不该点任何选项")
+
+    def test_ordinal_clicks_when_enabled(self):
+        """开关打开时，说序号仍然照常点（别把关掉做成了彻底废掉）"""
+        ctx, fake = make_ctx(GRE_XML)
+        ctx["cfg"].voice.commands = True
+
+        app.handle_speech("3", -0.4, ctx)
+
+        expected = screen.read_screen(GRE_XML).options[2]
+        self.assertEqual(fake.taps, [(expected.x, expected.y)],
+                         "打开开关后，说「3」应当点到第 3 个选项")
+
+    def test_saying_word_still_clicks_when_commands_off(self):
+        """说单词选选项**不受这个开关管** —— 它是用户语音的主力用法"""
+        ctx, fake = make_ctx(GRE_XML)
+
+        app.handle_speech("清晰", -0.4, ctx)
+
+        expected = screen.read_screen(GRE_XML).options[0]
+        self.assertEqual(fake.taps, [(expected.x, expected.y)],
+                         "开关管的是序号和控制语，不是「说选项里的词」")
 
 
 class QuitAfterNCalls:
@@ -1451,10 +1495,16 @@ class TestToggleFlag(unittest.TestCase):
         app._toggle_flag(ctx, "prefetch", "after_click", "点击后预读")
         self.assertTrue(ctx["cfg"].prefetch.after_click)
 
-    def test_works_on_voice_next(self):
+    def test_works_on_voice_commands(self):
+        """界面那个「语音说序号/下一题」开关（没有对应热键，走 _toggle_flag）"""
         ctx = {"cfg": Config()}
-        app._toggle_flag(ctx, "voice", "next_command", "语音说「下一题」")
-        self.assertFalse(ctx["cfg"].voice.next_command)
+        self.assertFalse(ctx["cfg"].voice.commands, "这个开关默认就是关")
+
+        app._toggle_flag(ctx, "voice", "commands", "语音说序号/下一题")
+        self.assertTrue(ctx["cfg"].voice.commands, "翻一下应当变成开")
+
+        app._toggle_flag(ctx, "voice", "commands", "语音说序号/下一题")
+        self.assertFalse(ctx["cfg"].voice.commands, "再翻一下应当变回关")
 
 
 class TestAnyEvent(unittest.TestCase):
@@ -1490,12 +1540,20 @@ class TestCollectState(unittest.TestCase):
 
     def test_reports_live_toggles(self):
         ctx = self._ctx()
+        # 语音控制开关默认关；这里要验的是「现读活对象」，所以先把它打开
+        ctx["cfg"].voice.commands = True
         state = app.collect_state(ctx)
         self.assertTrue(state["toggles"]["voice"])
         self.assertEqual(state["toggles"]["mode"], "listen")
         self.assertTrue(state["toggles"]["numpad"])
         self.assertTrue(state["toggles"]["prefetch"])
         self.assertTrue(state["toggles"]["voice_next"])
+
+    def test_voice_commands_toggle_defaults_off(self):
+        """界面拿到的值必须跟着配置走 —— 默认关就要显示关"""
+        state = app.collect_state(self._ctx())
+        self.assertFalse(state["toggles"]["voice_next"],
+                         "说序号/下一题合并后的开关默认关")
 
     def test_reflects_changes_immediately(self):
         ctx = self._ctx()
@@ -1705,8 +1763,14 @@ class TestUiStateWiring(unittest.TestCase):
         self.assertIn("没匹配上", events[0].outcome)
 
     def test_unmatched_ordinal_says_what_actually_went_wrong(self):
-        """说了超范围的序号 —— 要说清是序号超了，不能笼统说「屏幕上没有这个词」"""
+        """
+        说了超范围的序号 —— 要说清是序号超了，不能笼统说「屏幕上没有这个词」。
+
+        注意：`voice.commands` 默认关（说序号那条路整个不走，也就无所谓
+        「超范围」）。这里验的是**开着时**的报错文案，所以先把它打开。
+        """
         ctx, fake = self._ctx()
+        ctx["cfg"].voice.commands = True
 
         app.handle_speech("第七个", -0.4, ctx)
 
