@@ -272,7 +272,8 @@ class AppWindow:
   （三块内容都是普通数据），界面只负责画。
 - 按钮点击 → `on_intent(name)` → `main.handle_intent()`，由它塞进动作队列。
 - 窗口：`root.attributes("-topmost", True)`；可拖动（Tk 默认行为）；
-  几何位置从 `gui.window` 读，关闭时写回配置。
+  几何位置首启用 `gui.window`，关闭时把当前位置记到 `debug/gui_window.txt`。
+  **刻意不写回 `config.yaml`** —— 那份文件是逐行手写注释的，pyyaml 回写会把注释全抹掉。
 - 文字用等宽字体，避免数字跳动时布局抖动。
 
 ### 4.3 `main.py` 改动
@@ -322,7 +323,8 @@ gui:
   # 是否启动时自动开界面（也可以命令行 --gui 临时开）
   enabled: false
 
-  # 窗口位置与大小 [x, y, 宽, 高]。关窗口时会把当前值写回这里。
+  # 窗口位置与大小 [x, y, 宽, 高]。这只是**首次**的位置；
+  # 你拖动窗口后，当前位置记在 debug/gui_window.txt，下次开窗接着用那个。
   window: [40, 120, 360, 520]
 
   # 是否始终浮在最上层
