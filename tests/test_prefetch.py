@@ -334,7 +334,8 @@ class TestTriggerAfterClick(unittest.TestCase):
         self.assertIsNone(prefetcher.take())
 
     def test_logs_include_timing(self):
-        """日志里要能看出「第几次读到新版、距点击多久」—— 这是调等待时长的依据"""
+        """日志里要能看出「读到新界面、还是又读一次确认了，以及距点击多久」——
+        这是调等待时长的依据（预读最多两次，没有「第 3、4 次」了）"""
         prefetcher, _adb, logs, _cfg = make_prefetcher(FIRST_XML, SECOND_XML)
 
         prefetcher.note(screen.read_screen(FIRST_XML))

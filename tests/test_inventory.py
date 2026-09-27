@@ -30,10 +30,19 @@ BASELINE_COUNTS = {
     # 17 → 34：补上 gui.* 解析与「配置段写歪不能把程序拦在门外」两批用例
     # （TestGuiConfig / TestNonMappingSections）。基线贴着实际值，
     # 免得整类被删掉时用例数还高于基线、单靠数字发现不了。
-    "tests.test_config": 34,
+    # 2026-09-28（任务 3）：34 → 36 —— `voice.next_command`（原来默认 true）并入
+    # `voice.commands` 并改成**默认关**。老类 `TestVoiceNextCommand`（3 条：
+    # 默认开、随附配置是开、显式写关）换成 `TestVoiceCommandsSwitch`（5 条：
+    # 默认关、随附的 config.yaml 是关、显式写开能解析、显式写关不能解析歪、
+    # 老键 next_command 已从数据类里消失）。净 +2。
+    "tests.test_config": 36,
     "tests.test_hotkey": 25,
     # 51 → 53：补上控制语识别的 TestDetectControl（说「下一题」走哪条路）
-    "tests.test_matcher": 53,
+    # 2026-09-28（任务 3）：53 → 57 —— `voice.commands` 关掉时「说序号」这条路
+    # 要停用并退回文字匹配，而「说单词选选项」那条路不受它管。
+    # TestOrdinalCanBeDisabled 四条钉住这件事（默认照常、关掉后序号说法落空、
+    # 文字匹配不受影响、中文序号也一并挡住）。
+    "tests.test_matcher": 57,
     # 59 → 103：界面与语音「下一题」那一期加进来的用例（UiState 接线、
     # 动作时戳、意图/唤醒、窗口几何……）。基线贴着实际值。
     # 103 → 106：「下一题」固定坐标路径的前台护栏（peek 返回别的 App / None /
@@ -81,10 +90,14 @@ REQUIRED_CLASSES = {
         "TestRunVoiceLoop",                # 主循环能被抽出来单独跑（界面要占主线程）
         "TestRunVoiceLoopBranches",        # 主循环循环体的各条分支
         "TestHandleIntent",                # 界面按钮与热键走同一份代码
-        "TestToggleFlag",                  # 界面上的预读／语音下一题开关
+        "TestToggleFlag",                  # 界面上的预读／语音选择开关
         "TestAnyEvent",                    # 退出请求与唤醒合成一个中断源
         "TestVoiceNextCommand",            # 说「下一题」= 点下一题
         "TestCollectState",                # 界面显示的数据来源
+        # 2026-09-28（任务 4）：界面按钮的全部行为就是「把意图名交出去」，
+        # 表里没有 = 这个按钮静默死掉（真机上表现为「点了没反应」，而测试全绿）。
+        # 这条函数把静默变成出声，是本轮那次事故的护栏，按名字钉住：
+        "TestUnwiredIntents",              # 界面会发、意图表里却没有的名字要当场喊出来
         "TestUiStateWiring",               # 主流程有没有真的把数据交给界面
         "TestUiWiringWithoutUi",           # 没开界面时一切照旧
         "TestWindowGeometry",              # 窗口几何的存／读／坏值兜底
@@ -101,6 +114,16 @@ REQUIRED_CLASSES = {
         "TestAmbiguity",                   # 多候选怎么取舍
         "TestNoMatch",                     # 匹配不上就不点
         "TestDetectControl",               # 控制语识别（「下一题」走直给那条路）
+        # 2026-09-28（任务 3）：`voice.commands` 关掉「说序号」这条路，是本轮
+        # 按真机日志做的安全决定（环境杂音念出「第一个」就点了）。整类删掉时
+        # 用例数会掉到基线以下，但**改成等量的无关测试**就发现不了 —— 所以钉名字。
+        "TestOrdinalCanBeDisabled",        # 关掉后序号说法退回文字匹配
+    ],
+    "tests.test_config": [
+        # 2026-09-28（任务 3）：本轮唯一改了默认值的开关就在这里。它管着
+        # 「说序号」「说下一题」两类过于短促、易误触发的说法，默认关是用户的
+        # 明确要求；老键 next_command 必须彻底消失，不能留个能改回来的影子。
+        "TestVoiceCommandsSwitch",         # voice.commands 默认关、老键已删除
     ],
     "tests.test_ui_state": [
         "TestIntents",                     # 界面 → 主逻辑的意图队列

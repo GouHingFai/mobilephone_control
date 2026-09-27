@@ -48,7 +48,9 @@ class InputEvent:
     kind: str = ""          # speech / numpad / next / force_read
     label: str = ""         # 识别出的文字 / "3" / "0" / "."
     detail: str = ""        # 置信度、耗时等的附加说明
-    outcome: str = ""       # "点了第 4 个" / "已忽略：界面已翻页" / "没匹配上"
+    outcome: str = ""       # "点了第 4 个" / "已跳过（防连点）" / "没匹配上：…" / "已拒绝：…"
+                            # （没有「已忽略：界面已翻页」那条出路了 —— 动作时戳
+                            #  已在 2026-09-28 取消，按键一律生效，不再有被时戳拦下的）
     at: float = 0.0
 
 
