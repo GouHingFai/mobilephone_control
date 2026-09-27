@@ -713,10 +713,14 @@ def run_voice_loop(ctx, hotkeys, recognizer, once=False, wake_event=None):
 def handle_speech(text, logprob, ctx):
     """一句话的完整处理：抓屏 → 匹配 → 点击"""
     say(f"[听到] {text!r}   置信度 {logprob:.2f}")
-    # 界面第三块：先把「听到了什么」记下来（结果由后面的 do_click 补，
-    # 所以这里 outcome 先写「（见下）」）。
-    note_input(ctx, "speech", text,
-               detail=f"置信度 {logprob:.2f}", outcome="（见下）")
+    # 界面第三块：先把「听到了什么」记下来，outcome **留空**。
+    #
+    # 这里曾经写的是「（见下）」—— 意思是「结果在下面」。可匹配失败、读屏失败、
+    # 走了「下一题」这些分支时**根本不会有后续点击**，于是界面上会永久留着一条
+    # 没有下文的「见下」，比什么都不说更误导。
+    # 所以只如实显示「听到了什么」；真有结果时（点击 / 没匹配上）另记一条，
+    # 不去改这一条 —— UiState 的约定是构造好就不再改。
+    note_input(ctx, "speech", text, detail=f"置信度 {logprob:.2f}")
 
     timing = ctx["recognizer"].last_timing
     if timing:
@@ -751,6 +755,13 @@ def handle_speech(text, logprob, ctx):
         if result.ordinal_out_of_range:
             say(f"[匹配] 你说了第 {result.ordinal_out_of_range} 个，"
                 f"但屏幕上只有 {len(snap.options)} 个选项")
+            # 界面第三块：把「为什么没成」补记下来（开头那条只写了听到了什么）。
+            # 序号超范围时单独说清，别笼统地说「屏幕上没有这个词」—— 那是假话。
+            note_input(ctx, "speech", text,
+                       outcome=(f"没匹配上：你说了第 {result.ordinal_out_of_range} 个，"
+                                f"屏幕上只有 {len(snap.options)} 个选项"))
+        else:
+            note_input(ctx, "speech", text, outcome="没匹配上：屏幕上没有这个词")
         say(f"[匹配] 没找到 {text!r}")
         say(f"       屏幕上是这些选项：{' / '.join(snap.option_texts())}")
         say("       （要么是听错了，要么这个词屏幕上确实没有 —— "

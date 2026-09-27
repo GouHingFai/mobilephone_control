@@ -164,7 +164,13 @@ class StubRecognizer:
     last_timing = {}
 
 
-def make_ctx(xml, preview=False):
+def make_ctx(xml, preview=False, ui=None):
+    """
+    造一个最小可用的 ctx。
+
+    `ui` 默认 None —— **整个 ctx 里就不带 "ui" 这个键**，
+    模拟「不带 --gui 启动」。要测界面接线时传一个真的 `UiState()`。
+    """
     cfg = Config()
     fake = FakeAdb(xml)
     ctx = {
@@ -176,6 +182,8 @@ def make_ctx(xml, preview=False):
         "voice_gate": StubVoiceGate(),
         "clicker": Clicker(fake, cfg.click, log=lambda *_: None),
     }
+    if ui is not None:
+        ctx["ui"] = ui
     return ctx, fake
 
 
@@ -1470,6 +1478,203 @@ class TestNoteInput(unittest.TestCase):
 
     def test_noop_without_ui(self):
         app.note_input({"ui": None}, "numpad", "3")
+
+
+class TestUiStateWiring(unittest.TestCase):
+    """
+    「把数据交给界面」这条**接线**本身必须被测到 —— 不能只测那两个纯函数。
+
+    由来（和 TestActionWiring 是同一类问题，台账里这是第四次栽在它上面）：
+    `publish_screen` / `note_input` 两个纯函数本身有测试（见 TestPublishScreen /
+    TestNoteInput），但它们**被调用**的那几处 —— grab_screen 里的两处
+    publish_screen、do_click 里的两处 note_input、handle_numpad 与 handle_speech
+    里各一处 —— 原本零覆盖。把这些调用点**全部删掉**，275 个用例照样全绿，
+    而真机上界面会永远空着（谁把接线接错也没人拦得住）。
+
+    所以这里钉的不是「纯函数会不会算」，而是「主流程有没有真的把线接上」：
+    每一条断言都对应一个具体的调用点，把那一处调用删掉它就必须变红。
+    """
+
+    def _ctx(self, xml=GRE_XML):
+        """带真 UiState 的 ctx。关掉 settle，免得每条用例白等 0.3 秒。"""
+        ctx, fake = make_ctx(xml, ui=UiState())
+        ctx["cfg"].click.settle_ms = 0
+        return ctx, fake
+
+    def _recent_outcomes(self, ctx):
+        return [e.outcome for e in ctx["ui"].recent_inputs()]
+
+    # ------------------------------------------------ grab_screen → 界面
+
+    def test_grab_screen_hands_the_fresh_read_screen_to_the_ui(self):
+        """当场读屏那条路：读到的这一屏要交给 UiState"""
+        ctx, _fake = self._ctx()
+
+        snap, _source = app.grab_screen(ctx)
+
+        view = ctx["ui"].current_screen()
+        self.assertIsNotNone(view, "抓屏之后界面必须拿到「手里那一屏」")
+        self.assertEqual(view.prompt, snap.prompt, "题干要对得上")
+        self.assertEqual([o.text for o in view.options],
+                         [n.text for n in snap.options], "选项文字要对得上")
+        self.assertEqual([o.index for o in view.options], [1, 2, 3, 4, 5])
+
+    def test_grab_screen_hands_the_prefetched_screen_to_the_ui(self):
+        """用预读结果那条路**同样**要交给 UiState（两处调用点各钉一条）"""
+        ctx, fake = self._ctx()
+        ctx["prefetcher"].cached = (screen.read_screen(GRE_XML), 0.5)
+
+        app.grab_screen(ctx)
+
+        view = ctx["ui"].current_screen()
+        self.assertIsNotNone(view, "用预读结果时也要把界面交给 UiState")
+        self.assertEqual(view.source, "预读")
+        self.assertEqual(len(view.options), 5)
+        self.assertEqual(fake.dump_calls, 0, "有预读就不该再读屏（先确认真走了预读那条路）")
+
+    # -------------------------------------------- 点击后留下「我的输入」
+
+    def test_numpad_click_leaves_an_input_record(self):
+        """小键盘点完，界面第三块要有一条「我的输入」，且看得出点了第几个"""
+        ctx, fake = self._ctx()
+
+        app.handle_numpad(1, ctx)
+
+        self.assertEqual(len(fake.taps), 1, "先确认真的点了")
+        events = ctx["ui"].recent_inputs()
+        self.assertTrue(events, "点完之后界面要能看见「我的输入」")
+        self.assertEqual(events[0].kind, "numpad")
+        self.assertEqual(events[0].label, "1")
+        self.assertIn("第 1 个", events[0].outcome, "结果里要看得出点了第几个")
+
+    def test_debounced_click_is_recorded_as_skipped(self):
+        """被防连点挡掉的那一下，界面也要有个交代 —— 别记成「点了」"""
+        ctx, _fake = self._ctx()
+
+        app.handle_speech("清晰", -0.4, ctx)     # 这一下真的点了
+        app.handle_speech("阴郁", -0.4, ctx)     # 这一下被防连点挡掉
+
+        outcomes = self._recent_outcomes(ctx)
+        self.assertTrue(any("已跳过" in o for o in outcomes),
+                        f"被挡掉的那一下要记成「已跳过」，实际记的是 {outcomes!r}")
+
+    def test_stamp_rejected_press_leaves_an_ignored_record(self):
+        """按键后界面翻了页、这一下被时戳拦下 —— 界面要写明「已忽略」"""
+        cfg = Config()
+        cfg.prefetch.after_click = False     # 别让后台预读来搅乱
+        cfg.click.settle_ms = 0
+        fake = FakeAdb(GRE_XML)
+        pref = app.ScreenPrefetcher(fake, cfg, log=lambda *_: None)
+        pref.note(screen.read_screen(GRE_XML))
+        ctx = {
+            "adb": fake,
+            "cfg": cfg,
+            "preview": False,
+            "recognizer": StubRecognizer(),
+            "prefetcher": pref,
+            "voice_gate": StubVoiceGate(),
+            "clicker": Clicker(fake, cfg.click, log=lambda *_: None),
+            "ui": UiState(),
+        }
+        stamp = pref.identity()                       # 按下那一刻：第一题
+        pref.note(screen.read_screen(SECOND_XML))    # 轮到执行时已经翻页
+        fake.xml = SECOND_XML
+
+        app.handle_numpad(1, ctx, stamp=stamp)
+
+        self.assertEqual(fake.taps, [], "界面已经变了，这一下不能点")
+        outcomes = self._recent_outcomes(ctx)
+        self.assertTrue(any("已忽略" in o for o in outcomes),
+                        f"被时戳拦下的那一下要记成「已忽略」，实际记的是 {outcomes!r}")
+
+    # ------------------------------------------- 语音留下「听到了什么」
+
+    def test_speech_records_what_was_heard(self):
+        """语音路径要把「听到了什么」记进界面第三块"""
+        ctx, _fake = self._ctx()
+
+        app.handle_speech("清晰", -0.4, ctx)
+
+        heard = [e for e in ctx["ui"].recent_inputs() if e.label == "清晰"]
+        self.assertTrue(heard, "语音路径要记下「听到了什么」")
+
+    def test_heard_record_does_not_promise_a_followup(self):
+        """
+        开头那条「听到了什么」的 outcome 必须**留空**。
+
+        它曾经写的是「（见下）」—— 意思是结果在下面。可匹配失败、读屏失败、
+        走「下一题」这些分支都不会有后续点击，界面上于是永久留着一条没有下文的
+        「见下」，比什么都不说更误导。改完之后这一条只如实显示听到了什么。
+        """
+        ctx, _fake = self._ctx()
+
+        app.handle_speech("清晰", -0.4, ctx)
+
+        heard = [e for e in ctx["ui"].recent_inputs() if e.label == "清晰"]
+        self.assertTrue(heard, "先确认「听到了什么」那条真的记了")
+        self.assertEqual(heard[0].outcome, "",
+                         "「听到了什么」那条不该预告一个可能不存在的下文")
+
+    def test_unmatched_speech_records_a_clear_outcome(self):
+        """没匹配上时补一条说明白的 —— 界面不能只留一句「听到了什么」就没了"""
+        ctx, fake = self._ctx()
+
+        app.handle_speech("香蕉苹果橘子", -0.4, ctx)
+
+        self.assertEqual(fake.taps, [], "匹配不上不该点击")
+        events = ctx["ui"].recent_inputs()
+        self.assertEqual(len(events), 2, "「听到的」和「没匹配上」各一条")
+        self.assertIn("没匹配上", events[0].outcome)
+
+    def test_unmatched_ordinal_says_what_actually_went_wrong(self):
+        """说了超范围的序号 —— 要说清是序号超了，不能笼统说「屏幕上没有这个词」"""
+        ctx, fake = self._ctx()
+
+        app.handle_speech("第七个", -0.4, ctx)
+
+        self.assertEqual(fake.taps, [])
+        events = ctx["ui"].recent_inputs()
+        self.assertIn("没匹配上", events[0].outcome)
+        self.assertIn("5 个选项", events[0].outcome,
+                      "要说清屏幕上到底有几个选项，别笼统说「没有这个词」")
+
+
+class TestUiWiringWithoutUi(unittest.TestCase):
+    """
+    没开界面（ctx 里没有 ui，或 ui 为 None）时一切照旧 —— 「不带 --gui 行为不变」。
+
+    `publish_screen` / `note_input` 都以 `ctx.get("ui") is None` 当空操作。
+    这几条钉住那个空操作分支真的在：写成 `ctx["ui"].set_screen(...)` 就会在这里炸。
+    """
+
+    def _ctx(self, xml=GRE_XML):
+        ctx, fake = make_ctx(xml)            # 故意不带 ui
+        ctx["cfg"].click.settle_ms = 0
+        return ctx, fake
+
+    def test_grab_screen_is_harmless_without_ui(self):
+        ctx, fake = self._ctx()
+        app.grab_screen(ctx)                 # 不该抛异常
+        self.assertEqual(fake.taps, [])
+
+    def test_speech_path_still_clicks_without_ui(self):
+        ctx, fake = self._ctx()
+        app.handle_speech("清晰", -0.4, ctx)
+        self.assertEqual(len(fake.taps), 1, "不带界面时点击行为必须一模一样")
+
+    def test_numpad_path_still_clicks_without_ui(self):
+        ctx, fake = self._ctx()
+        app.handle_numpad(2, ctx)
+        self.assertEqual(len(fake.taps), 1)
+
+    def test_explicit_none_ui_is_also_safe(self):
+        """`ui=None`（键在、值为 None）和「没这个键」都得是空操作"""
+        ctx, fake = self._ctx()
+        ctx["ui"] = None
+
+        app.handle_speech("清晰", -0.4, ctx)
+
+        self.assertEqual(len(fake.taps), 1)
 
 
 if __name__ == "__main__":
