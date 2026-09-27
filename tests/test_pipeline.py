@@ -13,6 +13,7 @@ test_pipeline.py —— 端到端链路测试
 """
 
 import re
+import threading
 import unittest
 from pathlib import Path
 
@@ -1053,6 +1054,32 @@ class TestVoiceNextCommand(unittest.TestCase):
         app.handle_speech("下一题", -0.4, ctx)
 
         self.assertEqual(fake.taps, [], "关掉之后不该点；应落回普通匹配并提示详情页")
+
+
+class StubHotkeys:
+    """最小可用的热键替身：主循环只需要这两个事件"""
+
+    def __init__(self):
+        self.quit_requested = threading.Event()
+        self.ptt_pressed = threading.Event()
+
+
+class TestRunVoiceLoop(unittest.TestCase):
+    """
+    主循环必须能被单独调用 —— 界面要占主线程，它得能挪到后台线程去。
+    这一步是**纯重构**，行为必须和以前一模一样。
+    """
+
+    def test_returns_at_once_when_quit_already_requested(self):
+        hotkeys = StubHotkeys()
+        hotkeys.quit_requested.set()
+        ctx = {"mode": "listen", "voice_gate": StubVoiceGate()}
+
+        class MustNotBeCalled:
+            def listen_once(self, **kwargs):
+                raise AssertionError("已经请求退出了，不该再去监听")
+
+        app.run_voice_loop(ctx, hotkeys, MustNotBeCalled(), once=False)
 
 
 if __name__ == "__main__":

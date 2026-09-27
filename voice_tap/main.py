@@ -523,6 +523,51 @@ def report_unusable_screen(snap):
     show_screen(snap)
 
 
+def run_voice_loop(ctx, hotkeys, recognizer, once=False):
+    """
+    主循环：听 → 识别 → 点击。
+
+    抽成独立函数，是为了让界面能占主线程（Tkinter 的硬性要求）。
+    不带 --gui 时它仍旧跑在主线程，行为与以前完全一致。
+    """
+    while not hotkeys.quit_requested.is_set():
+        if ctx["mode"] == "listen":
+            if not ctx["voice_gate"].enabled:
+                # 语音关着（按了 F7）—— 不用监听，省得白忙
+                time.sleep(0.1)
+                continue
+            ctx["voice_gate"].wait_until_open(hotkeys.quit_requested)
+            utterance = recognizer.listen_once(
+                on_speech_start=ctx["prefetcher"].trigger_on_speech,
+                hint_snapshot=ctx["prefetcher"].peek(),
+            )
+        else:
+            # 等按下 F8；没按下就继续空转
+            if not hotkeys.ptt_pressed.wait(0.2):
+                continue
+            utterance = recognizer.listen_pressed(
+                hotkeys.ptt_pressed,
+                hint_snapshot=ctx["prefetcher"].peek(),
+            )
+
+        if utterance is None:
+            continue
+
+        text, logprob = utterance
+        if not text.strip():
+            continue
+
+        try:
+            handle_speech(text, logprob, ctx)
+        except AdbError as exc:
+            say(f"[!!] {exc}")
+
+        if once:
+            say()
+            say("  --once 模式，跑完一句就退出。")
+            break
+
+
 def handle_speech(text, logprob, ctx):
     """一句话的完整处理：抓屏 → 匹配 → 点击"""
     say(f"[听到] {text!r}   置信度 {logprob:.2f}")
@@ -955,42 +1000,7 @@ def main(argv=None):
 
     # --- 主循环
     try:
-        while not hotkeys.quit_requested.is_set():
-            if ctx["mode"] == "listen":
-                if not ctx["voice_gate"].enabled:
-                    # 语音关着（按了 F7）—— 不用监听，省得白忙
-                    time.sleep(0.1)
-                    continue
-                ctx["voice_gate"].wait_until_open(hotkeys.quit_requested)
-                utterance = recognizer.listen_once(
-                    on_speech_start=ctx["prefetcher"].trigger_on_speech,
-                    hint_snapshot=ctx["prefetcher"].peek(),
-                )
-            else:
-                # 等按下 F8；没按下就继续空转
-                if not hotkeys.ptt_pressed.wait(0.2):
-                    continue
-                utterance = recognizer.listen_pressed(
-                    hotkeys.ptt_pressed,
-                    hint_snapshot=ctx["prefetcher"].peek(),
-                )
-
-            if utterance is None:
-                continue
-
-            text, logprob = utterance
-            if not text.strip():
-                continue
-
-            try:
-                handle_speech(text, logprob, ctx)
-            except AdbError as exc:
-                say(f"[!!] {exc}")
-
-            if args.once:
-                say()
-                say("  --once 模式，跑完一句就退出。")
-                break
+        run_voice_loop(ctx, hotkeys, recognizer, once=args.once)
     except KeyboardInterrupt:
         say()
         say("  收到中断，正在退出 ...")
