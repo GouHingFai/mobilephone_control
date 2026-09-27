@@ -828,6 +828,52 @@ python -m unittest discover -s tests
   - 动作队列新增 `("intent", name, None)` 与 `("quit", None, None)`
   - `ctx["hotkeys"]`、`ctx["intents"]` 两个新键
 
+- [ ] **步骤 0（必须先做）：给主循环补一层驱动测试**
+
+**为什么先做**：任务 4 的审查**实测**发现，`TestRunVoiceLoop` 那条用例对循环体**零约束** ——
+把 `run_voice_loop` 的循环体整段删空、只留 `return`，它照样绿（quit 已置位，`while` 根本不进）。
+也就是说现在「全绿」并不代表循环体是对的。而这一步马上要改这个函数（加 `wake_event`、
+把 `stop_event` 传下去），**行为基线只有在改动之前建立才有价值** —— 改完再补，
+等于把改后的行为固化成「期望」。所以先补，再动。
+
+用假 Recognizer + 假 HotkeyManager 驱动，**不起真线程、不碰真音频**。先加这个桩：
+
+```python
+class StubRecognizerLoop:
+    """只记录被怎么调用的假识别器 —— 用来驱动主循环的各条分支"""
+
+    last_timing = {}
+
+    def __init__(self, utterances=None):
+        self.utterances = list(utterances or [])
+        self.calls = []          # [("listen_once", kwargs) | ("listen_pressed", kwargs)]
+
+    def listen_once(self, **kwargs):
+        self.calls.append(("listen_once", kwargs))
+        return self.utterances.pop(0) if self.utterances else None
+
+    def listen_pressed(self, held_event, **kwargs):
+        self.calls.append(("listen_pressed", kwargs))
+        return self.utterances.pop(0) if self.utterances else None
+```
+
+然后加测试类 `TestRunVoiceLoopBranches`，覆盖这些分支：
+
+| 用例 | 怎么驱动 | 断言什么 |
+|---|---|---|
+| listen 模式走 `listen_once` | `mode="listen"`，喂一句 `("清晰", -0.4)`，`once=True` | 真的点了（`fake.taps` 有 1 条）；`listen_once` 收到的 kwargs 里有 `hint_snapshot` 与 `on_speech_start` |
+| 语音关掉时短路 | `voice_gate.enabled = False` | `listen_once` **一次都没被调** |
+| hotkey 模式走 `listen_pressed` | `mode="hotkey"`，`ptt_pressed` 先置位，喂一句 | 调的是 `listen_pressed`，且第一个实参就是那个 `ptt_pressed` |
+| 识别返回 None | 喂 `None` | 循环继续、**没有点击** |
+| 空文字串被跳过 | 喂 `("   ", -0.4)` | **没有点击** |
+| `AdbError` 兜底不崩 | 让取屏那步抛 `AdbError`（把 `ctx["adb"]` 换成会抛的桩） | 循环不崩、返回正常 |
+| `once=True` 跑完一句就退 | 喂一句 | 函数**真的返回了**（没卡在循环里） |
+
+**写完必须先跑一遍确认它们能红**：临时把 `run_voice_loop` 的某个分支改坏
+（比如删掉 `voice_gate.enabled` 那个短路），确认有对应用例变红，再改回来。
+**这一步是关键** —— 任务 4 那条用例就是因为没做这个，才成了摆设（审查者的原话：
+「254 绿是假安全感」）。
+
 - [ ] **步骤 1：先写测试**
 
 在 `tests/test_pipeline.py` 末尾加：
@@ -1032,7 +1078,7 @@ def handle_intent(name, ctx, wake_event=None):
 python -m unittest discover -s tests
 ```
 
-期望：比开跑前多 6 个（HandleIntent 3 + ToggleFlag 2 + AnyEvent 1）。**重点确认不带 `--gui` 时行为没变** —— 这一步只加了能力，没改老路径。
+期望：比开跑前多 13 个（步骤 0 的循环分支 7 + HandleIntent 3 + ToggleFlag 2 + AnyEvent 1）。**重点确认不带 `--gui` 时行为没变** —— 这一步只加了能力，没改老路径。
 
 ---
 
