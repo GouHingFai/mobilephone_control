@@ -40,7 +40,10 @@ BASELINE_COUNTS = {
     # GRE3000 三种情形）三条用例。
     # 2026-09-28：删掉 TestActionStamp 的 5 个用例 —— 动作时戳按用户要求取消，
     # 理由见 tests/test_pipeline.py 里那段注释。
-    "tests.test_pipeline": 101,
+    # 101 → 104：补上界面按钮接线的三条护栏 —— on_intent 入队是二元组、
+    # 入队条目走真接线能真执行意图、解不开的条目要出声。就是防这次的 bug：
+    # 入队三元组没跟上二元组改动，界面每个按钮都点了没反应。
+    "tests.test_pipeline": 104,
     "tests.test_prefetch": 26,
     "tests.test_screen": 27,
     # 7：UiState（线程安全状态黑板）—— 界面与主逻辑唯一的交汇点

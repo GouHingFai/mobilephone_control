@@ -16,6 +16,7 @@ import re
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from voice_tap import main as app
 from voice_tap import screen
@@ -952,6 +953,44 @@ class TestActionWiring(unittest.TestCase):
 
         self.assertEqual(q.items, [("numpad", 1)])
 
+    def test_on_intent_puts_two_tuple(self):
+        """
+        界面意图入队必须是**二元组** `("intent", 名字)` —— 恰好两个元素。
+
+        这条是 2026-09-28 那次 bug 的护栏：入队还在用上一版带动作时戳的
+        三元组时，`dispatch_action` 一解包就抛 ValueError、被静默吞掉，
+        结果界面上每一个按钮都「点了没反应」。四个入队点现在都由
+        `make_action_putters` 决定格式，这条就钉住界面用的那个。
+        """
+        pref = self._prefetcher_with()
+        q = RecordingQueue()
+
+        app.make_action_putters(q, pref)["on_intent"]("toggle_voice")
+
+        self.assertEqual(q.items, [("intent", "toggle_voice")])
+        self.assertEqual(len(q.items[0]), 2,
+                         "意图条目是二元组，别再挂一个多余的值")
+
+    def test_on_intent_entry_from_queue_really_runs_the_intent(self):
+        """
+        界面按钮走**真接线**：`on_intent` 入队的那条 → `dispatch_action` → 意图真被执行。
+
+        这里**不手写**那条队列条目，而是让 `on_intent` 自己产生它、原样交给分派 ——
+        手写条目会把「入队格式」和「分派格式」两件事悄悄对齐，就测不到这次的 bug 了。
+        这条守的是「界面按钮点了有反应」。
+        """
+        ctx, fake = make_ctx(GRE_XML)
+        calls = []
+        ctx["intents"] = {"toggle_voice": lambda: calls.append("toggle_voice")}
+        q = RecordingQueue()
+
+        app.make_action_putters(q, ctx["prefetcher"])["on_intent"]("toggle_voice")
+        for action in q.items:
+            app.dispatch_action(action, ctx)
+
+        self.assertEqual(calls, ["toggle_voice"],
+                         "界面按钮的意图要真的被执行，不能只是排进队列就没了")
+
     # ---------------------------------------------------------- 解包分派
 
     def test_dispatch_numpad_really_clicks(self):
@@ -1002,9 +1041,30 @@ class TestActionWiring(unittest.TestCase):
 
     # ---------------------------------------------------------- 坏格式不崩
 
-    def test_malformed_action_is_ignored_silently(self):
+    def test_undecomposable_action_warns(self):
         """
-        格式不对的条目一律忽略：不抛异常，也不产生点击。
+        压根解不开的条目要**出声**：意图不执行，并且 `say()` 打出警告。
+
+        这跟「认不出来的 kind 静默忽略」是两回事 —— 后者是设计决定（见
+        `dispatch_action` 的注释），前者说明**我们自己的入队格式对不上**，
+        正是 2026-09-28 那次「界面按钮全体装死」的根因。所以这里断言
+        `say()` 把收到的原样打了出来，坏东西不再无声无息地消失。
+        """
+        ctx, fake = make_ctx(GRE_XML)
+        calls = []
+        ctx["intents"] = {"toggle_voice": lambda: calls.append("toggle_voice")}
+
+        with mock.patch.object(app, "say") as fake_say:
+            app.dispatch_action(("intent", "toggle_voice", None), ctx)
+
+        self.assertEqual(calls, [], "解不开的条目不该执行任何意图")
+        printed = " ".join(str(c.args[0]) for c in fake_say.call_args_list if c.args)
+        self.assertIn("解不开", printed, "解不开时要出声，别无声返回")
+        self.assertIn("toggle_voice", printed, "警告里要把收到的原样打出来")
+
+    def test_malformed_action_does_not_click_or_crash(self):
+        """
+        格式不对的条目一律忽略：不抛异常，也不产生点击（改坏时会在日志里喊一声）。
 
         这是工作线程的最后一道关口 —— 半截元组、None、一个数字之类的东西
         不该把线程掀翻，更不该冒出一个「点一下」的副作用。
@@ -1024,7 +1084,10 @@ class TestActionWiring(unittest.TestCase):
         for bad in bad_actions:
             with self.subTest(bad=bad):
                 ctx, fake = make_ctx(GRE_XML)
-                app.dispatch_action(bad, ctx)        # 不该抛异常
+                # 解不开的那几种现在会往日志喊一声；这是预期行为，
+                # 这里把 say 换掉，免得一屏噪音淹了测试输出。
+                with mock.patch.object(app, "say"):
+                    app.dispatch_action(bad, ctx)    # 不该抛异常
                 self.assertEqual(fake.taps, [], f"{bad!r} 不该点任何东西")
 
     def test_unknown_kind_is_ignored(self):

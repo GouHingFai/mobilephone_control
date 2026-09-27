@@ -342,17 +342,24 @@ class ScreenPrefetcher:
 
 def make_action_putters(queue, prefetcher):
     """
-    造三个「把动作塞进队列」的回调，供热键注册使用。
+    造四个「把动作塞进队列」的回调，供热键注册与界面按钮使用。
 
     入队格式是**二元组**：`(kind, value)`。`prefetcher` 参数保留只是为了
     函数签名稳定（等 `on_option`/`on_next` 将来可能又需要看屏幕），
-    现在的三个回调都用不到它。
+    现在的四个回调都用不到它。
 
     返回一个字典（键就是热键管理器要的回调名），免得靠位置记顺序：
 
         on_option(n)     —— 点第 n 个选项
         on_next()        —— 点「下一题」
         on_force_read()  —— 强制读屏
+        on_intent(name)  —— 执行一个来自界面的意图（按名字查 ctx["intents"]）
+
+    **四个入队点都收在这里是有原因的**（2026-09-28）：`on_intent` 原本是
+    `main()` 里一个内联 lambda，谁也测不到 —— 上回把格式从三元组改成二元组时，
+    它被漏下了，于是 `dispatch_action` 解包就抛、被静默吞掉，界面上每个按钮
+    都点了没反应，而全套测试照样全绿。收进这个函数，格式就由**能单测的一处**
+    决定，谁改坏了测试当场就红。
 
     2026-09-28：这里原本还给按键动作盖一个「动作时戳」（`prefetcher.identity()`），
     执行前拿它跟当前屏幕比、不一样就不点。那个时戳按用户要求取消了 ——
@@ -369,10 +376,17 @@ def make_action_putters(queue, prefetcher):
         # 它跟界面无关，只是重新同步，不需要任何附带信息。
         queue.put(("force_read", None))
 
+    def on_intent(name):
+        # 界面按钮：只把意图名字排进队列，真正执行交给工作线程里的 handle_intent。
+        # 和热键走的是同一条队列、同一个出口 —— 所以不会出现「界面显示开着、
+        # 实际没开」这种分裂。
+        queue.put(("intent", name))
+
     return {
         "on_option": on_option,
         "on_next": on_next,
         "on_force_read": on_force_read,
+        "on_intent": on_intent,
     }
 
 
@@ -390,9 +404,18 @@ def dispatch_action(action, ctx):
     try:
         kind, value = action
     except (TypeError, ValueError):
-        # 格式不对（不是长度 2 的可解包对象）：直接忽略，不抛异常。
-        # 这是工作线程的最后一道关口 —— 半截元组、None、一个数字之类的东西
-        # 不该把线程掀翻，更不该冒出一个「点一下」的副作用。
+        # **压根解不开**：不是长度 2 的可解包对象。
+        # 这跟上面「认不出来的 kind」是两回事 —— 那个是我们有意无视的未知；
+        # 这个说明**我们自己的入队格式对不上**（2026-09-28 就栽在这里：界面入队
+        # 还在用上一版的三元组，解包一抛就被静默吞掉，界面上每个按钮都装死，
+        # 而三百多条测试全绿）。所以这一支要出声，把收到的原样打进日志。
+        #
+        # 关于刷屏：坏条目只可能来自我们自己的代码，队列里不会成批出现；
+        # 工作线程 0.2 秒取一条，真出问题时我们**更希望它一直喊**，而不是
+        # 喊一声就安静 —— 免得又变成「第一次提醒被忽略、后面全无声」。
+        # 因此不做「只在内容变化时打」的节流。
+        say(f"[!!] 动作队列里收到解不开的条目：{action!r} —— "
+            f"多半是某处入队格式没跟上分派，请检查 make_action_putters 的四个回调")
         return
 
     if kind == "numpad":
@@ -1278,7 +1301,7 @@ def main(argv=None):
                 # 丢进**已有的那条动作队列**（和热键同一个出口），不另写一套，
                 # 所以不会出现「界面显示开着、实际没开」这种分裂。
                 collect_state=lambda: collect_state(ctx),
-                on_intent=lambda name: numpad_queue.put(("intent", name, None)),
+                on_intent=putters["on_intent"],
                 refresh_ms=cfg.gui.refresh_ms,
                 topmost=cfg.gui.topmost,
                 geometry=_load_window_geometry(window_file, cfg.gui.window),
