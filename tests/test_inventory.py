@@ -44,7 +44,10 @@ BASELINE_COUNTS = {
     # 入队条目走真接线能真执行意图、解不开的条目要出声。就是防这次的 bug：
     # 入队三元组没跟上二元组改动，界面每个按钮都点了没反应。
     "tests.test_pipeline": 104,
-    "tests.test_prefetch": 26,
+    # 26 → 27：预读改成「最多读两次」（见 test_prefetch.py）。原有的
+    # 「试满次数再放弃」改写成「一直没变也收下」（1 条），另加「读到新界面只读一次」（1 条），
+    # 共 +1。
+    "tests.test_prefetch": 27,
     "tests.test_screen": 27,
     # 7：UiState（线程安全状态黑板）—— 界面与主逻辑唯一的交汇点
     "tests.test_ui_state": 7,

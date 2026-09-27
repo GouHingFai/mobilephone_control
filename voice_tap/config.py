@@ -140,11 +140,10 @@ class PrefetchConfig:
     # 太早读到的是翻页前的界面 —— 那是最危险的情况（拿旧坐标点新题）。
     click_delay_ms: int = 300
 
-    # 读到还是旧界面时，隔多久再读一次（毫秒）
+    # 读到还是旧界面时，隔多久再读一次（毫秒）。
+    # 注意现在总共**最多读两次**：第一次读到新界面就收工，还是旧界面就隔这么久
+    # 再读一次确认（第二次无论读到什么都收下）。不再有第 3、4 次。
     click_retry_ms: int = 250
-
-    # 最多尝试几次
-    click_max_attempts: int = 4
 
     # 预读结果最多能用多久（秒）。
     # 放太久有风险：如果你用鼠标自己翻了页，缓存里就是过期界面。
@@ -433,8 +432,6 @@ def load_config(path=None) -> Config:
         after_click=_pick(pf, "after_click", PrefetchConfig.after_click, _to_bool, n, "prefetch"),
         click_delay_ms=_pick(pf, "click_delay_ms", PrefetchConfig.click_delay_ms, int, n, "prefetch"),
         click_retry_ms=_pick(pf, "click_retry_ms", PrefetchConfig.click_retry_ms, int, n, "prefetch"),
-        click_max_attempts=_pick(pf, "click_max_attempts", PrefetchConfig.click_max_attempts,
-                                 int, n, "prefetch"),
         cache_max_age=_pick(pf, "cache_max_age", PrefetchConfig.cache_max_age, float, n, "prefetch"),
     )
 

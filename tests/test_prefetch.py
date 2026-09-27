@@ -49,7 +49,6 @@ def make_prefetcher(*xmls, **overrides):
         after_click=True,
         click_delay_ms=1,
         click_retry_ms=1,
-        click_max_attempts=3,
         cache_max_age=8.0,
         on_speech=False,
     )
@@ -272,8 +271,8 @@ class TestPeek(unittest.TestCase):
 class TestTriggerAfterClick(unittest.TestCase):
 
     def test_reads_until_screen_changes(self):
-        """第一次读到旧界面，第二次读到新的 —— 应该取新的那份"""
-        prefetcher, adb, logs, _cfg = make_prefetcher(FIRST_XML, FIRST_XML, SECOND_XML)
+        """第一次读到旧界面，第二次（那次确认读）读到新的 —— 应该取新的那份"""
+        prefetcher, adb, logs, _cfg = make_prefetcher(FIRST_XML, SECOND_XML)
 
         prefetcher.note(screen.read_screen(FIRST_XML))   # 点击之前看到的
         prefetcher.invalidate()
@@ -284,20 +283,37 @@ class TestTriggerAfterClick(unittest.TestCase):
         self.assertIsNotNone(cached, "应该读到新界面并存下来")
         snap, _age = cached
         self.assertEqual(snap.prompt, "prototype", "存下来的应该是新题目的界面")
-        self.assertGreaterEqual(adb.calls, 3)
+        self.assertEqual(adb.calls, 2, "第一次是旧界面，确认读一次就够了")
 
-    def test_gives_up_when_screen_never_changes(self):
-        """界面一直没变（比如本来就没翻页），试完次数就放弃"""
-        prefetcher, adb, logs, _cfg = make_prefetcher(FIRST_XML, click_max_attempts=3)
+    def test_never_changes_still_stores_after_two_reads(self):
+        """
+        界面一直没变（比如点完根本不翻页）—— 读两次就收下，不无限重试。
+
+        用户的原话：连续两次读到的内容一样，就说明这就是当前屏幕。
+        而现在的「读到的还和点击前一样就再读一次」，最多 4 次、白耗十秒，
+        期间他的按键全被挡住。
+        """
+        prefetcher, adb, logs, _cfg = make_prefetcher(FIRST_XML, click_retry_ms=1)
 
         prefetcher.note(screen.read_screen(FIRST_XML))
         prefetcher.invalidate()
         prefetcher.trigger_after_click()
         self.assertTrue(wait_idle(prefetcher))
 
-        self.assertIsNone(prefetcher.take(), "没有变化就不该存东西")
-        self.assertEqual(adb.calls, 3, "应该试满次数再放弃")
-        self.assertTrue(any("放弃" in line for line in logs))
+        self.assertEqual(adb.calls, 2, "最多读两次，不该有第 3、4 次")
+        self.assertIsNotNone(prefetcher.take(), "第二次读到的就是当前屏，要收下")
+        self.assertTrue(any("两次" in line or "确认" in line for line in logs))
+
+    def test_reads_once_when_screen_changed(self):
+        """读到新界面时只读一次 —— 不再多读一遍去「确认」"""
+        prefetcher, adb, _logs, _cfg = make_prefetcher(SECOND_XML)
+
+        prefetcher.note(screen.read_screen(FIRST_XML))
+        prefetcher.invalidate()
+        prefetcher.trigger_after_click()
+        self.assertTrue(wait_idle(prefetcher))
+
+        self.assertEqual(adb.calls, 1, "第一次就读到新界面就不该再读")
 
     def test_first_read_accepted_when_no_baseline(self):
         """还没有任何指纹时（比如刚启动），第一次读到就直接用"""

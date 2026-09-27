@@ -282,7 +282,7 @@ class ScreenPrefetcher:
         threading.Thread(target=work, daemon=True, name="prefetch-on-speech").start()
 
     def trigger_after_click(self):
-        """点击之后预读，直到读到和点击前不一样的界面为止"""
+        """点击之后预读：读到新界面就收工；还是旧界面就再读一次确认，最多两次"""
         if not self.cfg.after_click:
             return
 
@@ -293,35 +293,52 @@ class ScreenPrefetcher:
             before = self._signature
 
         def work():
-            attempts = max(1, self.cfg.click_max_attempts)
             delay = self.cfg.click_delay_ms / 1000.0
             retry = self.cfg.click_retry_ms / 1000.0
             started = time.monotonic()
-            note = ""
             try:
-                for attempt in range(1, attempts + 1):
-                    time.sleep(delay if attempt == 1 else retry)
+                time.sleep(delay)
+                read_start = time.monotonic()
+                try:
+                    snap = screen.read_screen(self.adb.dump_ui())
+                except Exception as exc:  # noqa: BLE001
+                    self.log(f"       [预读] 读屏失败（{type(exc).__name__}），放弃")
+                    return
+                read_ms = (time.monotonic() - read_start) * 1000
 
-                    read_start = time.monotonic()
-                    try:
-                        snap = screen.read_screen(self.adb.dump_ui())
-                    except Exception as exc:  # noqa: BLE001
-                        note = f"读屏失败（{type(exc).__name__}）"
-                        continue
-                    read_ms = (time.monotonic() - read_start) * 1000
-                    elapsed = (time.monotonic() - started) * 1000
+                if before is None or self.signature(snap) != before:
+                    self.note(snap, read_at=read_start)
+                    self.log(f"       [预读] 读到新界面，"
+                             f"距点击 {(time.monotonic() - started) * 1000:.0f} 毫秒"
+                             f"（本次读屏 {read_ms:.0f} 毫秒）")
+                    return
 
-                    if before is None or self.signature(snap) != before:
-                        self.note(snap, read_at=read_start)
-                        self.log(f"       [预读] 第 {attempt} 次读到新界面，"
-                                 f"距点击 {elapsed:.0f} 毫秒（本次读屏 {read_ms:.0f} 毫秒）")
-                        return
+                # 和点击前一样：再读一次确认。
+                #
+                # **只确认一次，不再有第 3、4 次。** 理由（用户提出、日志支持）：
+                # 连续两次读到同一屏，就说明这就是当前屏幕 —— 继续读不会读到别的，
+                # 只会白耗时间（每次读屏约 2.4 秒），而这段时间用户的按键全被挡住。
+                # 真机日志里有 5 次白读满 4 遍，最长拖了 16.8 秒。
+                self.log(f"       [预读] 还是旧界面，再读一次确认"
+                         f"（距点击 {(time.monotonic() - started) * 1000:.0f} 毫秒）")
+                time.sleep(retry)
+                read_start = time.monotonic()
+                try:
+                    snap = screen.read_screen(self.adb.dump_ui())
+                except Exception as exc:  # noqa: BLE001
+                    self.log(f"       [预读] 第二次读屏失败（{type(exc).__name__}），放弃")
+                    return
+                read_ms = (time.monotonic() - read_start) * 1000
+                elapsed = (time.monotonic() - started) * 1000
 
-                    self.log(f"       [预读] 第 {attempt} 次还是旧界面，"
-                             f"距点击 {elapsed:.0f} 毫秒（本次读屏 {read_ms:.0f} 毫秒），再等等")
-
-                self.log(f"       [预读] 试了 {attempts} 次都没读到变化，放弃"
-                         + (f"（{note}）" if note else ""))
+                # 第二次无论读到什么，都收下 —— 它反映的就是当下这一屏。
+                self.note(snap, read_at=read_start)
+                if self.signature(snap) == before:
+                    self.log(f"       [预读] 两次一样，认定这就是当前屏，收下"
+                             f"（距点击 {elapsed:.0f} 毫秒，本次读屏 {read_ms:.0f} 毫秒）")
+                else:
+                    self.log(f"       [预读] 第二次读到了新界面，收下"
+                             f"（距点击 {elapsed:.0f} 毫秒，本次读屏 {read_ms:.0f} 毫秒）")
             finally:
                 with self._lock:
                     self._busy = False
