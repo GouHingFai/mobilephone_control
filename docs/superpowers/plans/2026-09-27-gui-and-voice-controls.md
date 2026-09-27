@@ -15,7 +15,12 @@
 - **测试命令**：`python -m unittest discover -s tests`（**没有 pytest**，别用 `-m pytest`）。沙箱里跑需要先 `pip install pypinyin --break-system-packages`，否则 3 个拼音测试会因为缺库而失败（那是环境问题）。
 - **项目已启用 git**（2026-09-27 建立基线，初始提交“chore: 建立版本控制基线”）。每个任务做完执行 `git add -A && git commit -m "..."`。
   仓库里已配好 `core.autocrlf=false` 与 `.gitattributes`（**强制 `.bat` 保持 CRLF**）——**不要改动这两样，把行尾转换打开会把 `.bat` 改坏**。沙箱里 git 需要删除权限，已开。
-- **每个任务开始前先在项目根目录跑一次** `python3 -m unittest discover -s tests` **确认起点是绿的**（基线 222 个用例）。
+- **每个任务开始前先在项目根目录跑一次** `python3 -m unittest discover -s tests` **确认起点是绿的**。
+- **各任务末尾的「期望」一律写成「比开跑前多 N 个」，不要用绝对数** —— 用例总数会随任务累积，
+  绝对数一写就过时。请以你自己跑第 1 条命令时输出的那个数为基准去加。
+- **跑测试前先清一次字节码缓存**：`rm -rf tests/__pycache__ voice_tap/__pycache__`。
+  本仓库里 `.py` 和 `.pyc` 常在同一秒落盘，改动若不改变字节数（比如交换两行），
+  Python 会复用旧字节码、读到错的版本 —— 做「故意改坏看测试红不红」这类实验时尤其会中招。
 - **不带 `--gui` 时，行为必须与现在完全一致。** 任务 4/5/6 是重构，靠现有的 222 个测试兜底；每步都要跑全套。
 - **所有用户可见输出走 `main.say()`**（同时打印并落盘到 `debug/run_*.log`），不要用裸 `print()`。
 - **`.bat` 文件必须纯 ASCII + CRLF 行尾**，中文提示一律放在 Python 里（用 Write 工具写出来的是 LF，需要以二进制方式写并显式替换成 `\r\n`）。
@@ -411,7 +416,7 @@ class TestVoiceNextCommand(unittest.TestCase):
 python -m unittest discover -s tests
 ```
 
-期望：235 个全过（227 + 8：matcher 2 + config 3 + pipeline 3）。
+期望：比开跑前多 8 个（matcher 2 + config 3 + pipeline 3）。
 
 ---
 
@@ -647,7 +652,7 @@ class UiState:
 python -m unittest tests.test_ui_state -v
 ```
 
-期望：`TestScreen`(2) + `TestInputs`(3) + `TestIntents`(2) = 7 个用例全过（累计 242）。
+期望：`TestScreen`(2) + `TestInputs`(3) + `TestIntents`(2) = 比开跑前多 7 个。
 
 ---
 
@@ -773,7 +778,7 @@ def run_voice_loop(ctx, hotkeys, recognizer, once=False):
 python -m unittest discover -s tests
 ```
 
-期望：243 个全过（242 + 1）。**这一步不许有任何行为变化** —— 如果有测试挂了，说明搬家时漏了东西，回去看，不要改测试。
+期望：比开跑前多 1 个。**这一步不许有任何行为变化** —— 如果有测试挂了，说明搬家时漏了东西，回去看，不要改测试。
 
 ---
 
@@ -1004,7 +1009,7 @@ def handle_intent(name, ctx, wake_event=None):
 python -m unittest discover -s tests
 ```
 
-期望：249 个全过（243 + 6：HandleIntent 3 + ToggleFlag 2 + AnyEvent 1）。**重点确认不带 `--gui` 时行为没变** —— 这一步只加了能力，没改老路径。
+期望：比开跑前多 6 个（HandleIntent 3 + ToggleFlag 2 + AnyEvent 1）。**重点确认不带 `--gui` 时行为没变** —— 这一步只加了能力，没改老路径。
 
 ---
 
@@ -1213,7 +1218,7 @@ def note_input(ctx, kind, label, detail="", outcome=""):
 python -m unittest discover -s tests
 ```
 
-期望：256 个全过（249 + 7：CollectState 3 + PublishScreen 2 + NoteInput 2）。
+期望：比开跑前多 7 个（CollectState 3 + PublishScreen 2 + NoteInput 2）。
 
 ---
 
@@ -1528,7 +1533,7 @@ python -m unittest discover -s tests
 python -c "compile(open('voice_tap/main.py', encoding='utf-8').read(), 'main.py', 'exec'); print('OK')"
 ```
 
-期望：256 全过（这一步不应改变任何测试结果）。
+期望：用例数与开跑前**完全相同**（这一步只加界面，不改任何测试）。
 
 - [ ] **步骤 6（用户侧手工冒烟，必须做）**
 
