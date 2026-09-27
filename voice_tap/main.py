@@ -30,7 +30,7 @@ from .asr import AsrError, Recognizer
 from .clicker import Clicker
 from .config import load_config
 from .hotkey import HotkeyManager
-from .ui_state import InputEvent, OptionView, ScreenView
+from .ui_state import InputEvent, OptionView, ScreenView, UiState
 from .voice_gate import VoiceGate
 
 # 所有输出同时写一份到文件。
@@ -985,6 +985,41 @@ def run_calibrate(ctx):
     return exit_code
 
 
+# ---------------------------------------------------------------- 窗口位置
+
+def _load_window_geometry(path, fallback):
+    """
+    读上次记下的窗口位置与大小。
+
+    **刻意不写回 config.yaml** —— pyyaml 回写会把那份精心写的注释全抹掉。
+    所以窗口位置单独存在这个文件里。
+
+    读不到、读坏了、或者少于四个数，一律退回 `fallback`（配置里给的初始位置）。
+    """
+    try:
+        parts = Path(path).read_text(encoding="utf-8").split()
+        if len(parts) >= 4:
+            return tuple(int(p) for p in parts[:4])
+    except Exception:  # noqa: BLE001
+        pass
+    return fallback
+
+
+def _save_window_geometry(path, geometry):
+    """
+    把关窗口时的位置记下来，下次接着用。
+
+    存不下来不是大事（下次用回默认位置而已），所以这里**吞掉所有异常** ——
+    绝不能因为一个存档文件写不进去，把正常的退出流程带崩。
+    """
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(" ".join(str(v) for v in geometry), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="声控手机助手 —— 说出选项文字，自动点它",
@@ -997,6 +1032,7 @@ def main(argv=None):
     parser.add_argument("--preview", action="store_true", help="不真点，只把位置画圈存图")
     parser.add_argument("--once", action="store_true", help="只说一句就退出（调试用）")
     parser.add_argument("--dump", action="store_true", help="只抓一次屏幕并打印，不识别不点击")
+    parser.add_argument("--gui", action="store_true", help="同时打开置顶浮窗")
     parser.add_argument("--calibrate", action="store_true",
                         help="量出当前界面的选项坐标和「下一题」按钮坐标，生成配置片段")
     args = parser.parse_args(argv)
@@ -1051,6 +1087,14 @@ def main(argv=None):
 
     # --- 只做屏幕解析检查
     if args.dump:
+        if args.gui or cfg.gui.enabled:
+            # 说清楚为什么没开窗，免得用户以为界面坏了：
+            # --dump 在这里就返回了，而界面要用的那几样东西（语音、热键、界面状态）
+            # 全都在这条路径之后才装配。想单独看一眼界面，直接跑 run_gui.bat
+            # （或者不加 --dump 的 --gui）。
+            say("  [注意] --dump 不会打开界面：它只抓一次屏就退出，"
+                "而界面要用的模块是在这之后才装配的。")
+            say("         只想看界面请直接跑 run_gui.bat（或 python -m voice_tap.main --gui）。")
         return run_dump_once(ctx)
 
     # --- 只做坐标标定
@@ -1084,6 +1128,24 @@ def main(argv=None):
     ctx["mode"] = mode
     ctx["clicker"] = Clicker(adb, cfg.click, log=say, debug_dir=debug_dir)
     ctx["voice_gate"] = VoiceGate(cfg.voice, log=say)
+
+    # --- 界面（可选）
+    # 开不开：命令行 --gui，或者 config.yaml 里 gui.enabled，二者取或。
+    #
+    # 「界面能不能起来」在这里就问清楚 —— Tkinter 没装是最常见的失败，
+    # 而它会直接在 import 时抛出来。**界面起不来不该把程序拦在门外**
+    # （设计文档 §6 明说）：退回纯命令行继续跑，而不是让整个程序崩掉。
+    # 换句话说，不带 --gui 时这里一行都不会执行，行为与从前完全一致。
+    use_gui = args.gui or cfg.gui.enabled
+    gui = None
+    if use_gui:
+        try:
+            from . import gui
+        except Exception as exc:  # noqa: BLE001
+            say(f"  [注意] 界面打不开（{type(exc).__name__}: {exc}），"
+                f"退回纯命令行模式继续跑")
+            use_gui = False
+    ctx["ui"] = UiState() if use_gui else None
 
     # --- 热键
     section("准备热键")
@@ -1179,6 +1241,49 @@ def main(argv=None):
     say()
 
     # --- 主循环
+    if use_gui:
+        # 界面必须占主线程（Tkinter 的硬性要求），所以听语音挪到后台线程去。
+        # 不带 --gui 时下面那条老路原样不动。
+        #
+        # 窗口位置存在 debug/gui_window.txt，**不写回 config.yaml** ——
+        # pyyaml 回写会把那份逐行手写的注释全抹掉。
+        window_file = debug_dir / "gui_window.txt"
+        loop_thread = threading.Thread(
+            target=run_voice_loop,
+            args=(ctx, hotkeys, recognizer),
+            kwargs={"once": args.once, "wake_event": wake_event},
+            daemon=True, name="voice-loop",
+        )
+        loop_thread.start()
+        try:
+            gui.run(
+                # collect_state 是界面数据的唯一来源；界面按钮只是把意图名字
+                # 丢进**已有的那条动作队列**（和热键同一个出口），不另写一套，
+                # 所以不会出现「界面显示开着、实际没开」这种分裂。
+                collect_state=lambda: collect_state(ctx),
+                on_intent=lambda name: numpad_queue.put(("intent", name, None)),
+                refresh_ms=cfg.gui.refresh_ms,
+                topmost=cfg.gui.topmost,
+                geometry=_load_window_geometry(window_file, cfg.gui.window),
+                on_closed=lambda geom: (
+                    _save_window_geometry(window_file, geom),
+                    hotkeys.quit_requested.set(),
+                ),
+            )
+        finally:
+            # 关窗口 = 退出请求（on_closed 里已经置过一次）。这里再置一次是兜底：
+            # 万一 mainloop 是被别的方式结束的，监听线程也得跟着停下来。
+            hotkeys.quit_requested.set()
+            loop_thread.join(timeout=3)
+            worker_stop.set()
+            hotkeys.stop()
+            recognizer.close()
+
+        say()
+        say("  已退出。")
+        say()
+        return 0
+
     try:
         run_voice_loop(ctx, hotkeys, recognizer, once=args.once)
     except KeyboardInterrupt:

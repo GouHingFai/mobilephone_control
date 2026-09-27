@@ -153,6 +153,31 @@ class PrefetchConfig:
 
 
 @dataclass
+class GuiConfig:
+    """
+    置顶浮窗（gui.py）。
+
+    默认**不自动开**：界面要占主线程、还依赖 Tkinter，不是每台机器都合适。
+    命令行加 `--gui` 可以临时打开，不必改这里。
+    """
+
+    # 启动时是否自动开界面
+    enabled: bool = False
+
+    # 窗口位置与大小 [x, y, 宽, 高]。
+    #
+    # 注意：**关窗口时的当前位置不写回这里** —— pyyaml 回写会把这份逐行手写的
+    # 注释全抹掉。它单独存在 debug/gui_window.txt 里（见 main._save_window_geometry）。
+    window: tuple = (40, 120, 360, 520)
+
+    # 是否始终浮在最上层（scrcpy 就在下面）
+    topmost: bool = True
+
+    # 界面刷新间隔（毫秒）
+    refresh_ms: int = 150
+
+
+@dataclass
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     asr: AsrConfig = field(default_factory=AsrConfig)
@@ -162,6 +187,7 @@ class Config:
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     run: RunConfig = field(default_factory=RunConfig)
     prefetch: PrefetchConfig = field(default_factory=PrefetchConfig)
+    gui: GuiConfig = field(default_factory=GuiConfig)
     # 加载过程中的提示信息，交给调用方打印（模块本身不直接输出）
     notices: list = field(default_factory=list)
 
@@ -224,6 +250,26 @@ def _to_position(value):
     """单个坐标 [x, y]；解析不出来就返回 None"""
     positions = _to_positions(value)
     return positions[0] if positions else None
+
+
+def _to_window(value, default, notices):
+    """
+    把 `gui.window` 解析成 (x, y, 宽, 高) 四个整数；不合法就整体退回默认值。
+
+    为什么要「整体退回」而不是逐个数补默认：**半截的窗口位置没有意义** ——
+    缺一个数、或者里面混进了文字，拼出来的窗口会跑到屏幕外面去，
+    还不如干脆用默认位置。这是「读不到也要能跑」那条原则的延续。
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        notices.append(f"config.yaml 的 gui.window 不是四个数（{value!r}），"
+                       f"改用默认值 {default!r}")
+        return default
+    try:
+        return tuple(int(v) for v in value)
+    except (TypeError, ValueError):
+        notices.append(f"config.yaml 的 gui.window 里有非整数（{value!r}），"
+                       f"改用默认值 {default!r}")
+        return default
 
 
 def _pick(section: dict, key: str, default, caster, notices, where: str):
@@ -349,6 +395,14 @@ def load_config(path=None) -> Config:
         click_max_attempts=_pick(pf, "click_max_attempts", PrefetchConfig.click_max_attempts,
                                  int, n, "prefetch"),
         cache_max_age=_pick(pf, "cache_max_age", PrefetchConfig.cache_max_age, float, n, "prefetch"),
+    )
+
+    gt = data.get("gui") or {}
+    cfg.gui = GuiConfig(
+        enabled=_pick(gt, "enabled", GuiConfig.enabled, _to_bool, n, "gui"),
+        window=_to_window(gt.get("window"), GuiConfig.window, n),
+        topmost=_pick(gt, "topmost", GuiConfig.topmost, _to_bool, n, "gui"),
+        refresh_ms=_pick(gt, "refresh_ms", GuiConfig.refresh_ms, int, n, "gui"),
     )
 
     if cfg.run.default_mode not in ("listen", "hotkey"):
