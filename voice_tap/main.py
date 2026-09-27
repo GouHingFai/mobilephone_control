@@ -211,19 +211,6 @@ class ScreenPrefetcher:
         with self._lock:
             return self._miss
 
-    def identity(self):
-        """
-        最近见过那一屏的指纹；还没读到过任何界面时返回 None。
-
-        用途是给按键动作盖章：按下的那一刻记下「当时屏幕长什么样」，
-        真正执行前再比一次 —— 不一样，就说明中间翻了页，这一下不能点。
-        （参见 handle_numpad 的 stamp 参数与 tests 里的 TestActionStamp。）
-        """
-        with self._lock:
-            if self._last_seen is None:
-                return None
-            return self.signature(self._last_seen)
-
     def take_or_wait(self, timeout=8.0):
         """
         取缓存；如果正好有一次预读在跑，**先等它跑完再取**。
@@ -346,36 +333,41 @@ class ScreenPrefetcher:
 #
 # 「按下一个键」到「真的执行这个动作」中间隔着一条流水线：
 #
-#     热键回调（按键那一刻）→ 盖戳 → 入队 → 工作线程解包 → 分派 → 处理函数
+#     热键回调（按键那一刻）→ 入队 → 工作线程解包 → 分派 → 处理函数
 #
 # 这条线以前是写在 main() 的三个 lambda 和一个闭包里的，外部调不到 ——
-# 于是谁把 `("numpad", n, 戳)` 写成两元组、或者把解包写反，测试也照绿，
-# 而真机上就是那个「连按两下点到新题」的老毛病。抽成模块级函数就是为了能钉住它。
+# 于是谁把 `("numpad", n)` 写成三元组、或者把解包写反，测试也照绿，
+# 而真机上就是那个「按键没生效 / 点到别的地方」的老毛病。抽成模块级函数就是为了能钉住它。
 
 
 def make_action_putters(queue, prefetcher):
     """
     造三个「把动作塞进队列」的回调，供热键注册使用。
 
-    **盖戳的时机就在这儿**：回调跑在按键那一刻，所以这时候取 `prefetcher.identity()`，
-    拿到的就是「按下时屏幕上是什么」。这个戳一路带到工作线程，执行前用来核对。
+    入队格式是**二元组**：`(kind, value)`。`prefetcher` 参数保留只是为了
+    函数签名稳定（等 `on_option`/`on_next` 将来可能又需要看屏幕），
+    现在的三个回调都用不到它。
 
     返回一个字典（键就是热键管理器要的回调名），免得靠位置记顺序：
 
-        on_option(n)     —— 点第 n 个选项，带戳
-        on_next()        —— 点「下一题」，带戳
-        on_force_read()  —— 强制读屏，**不带戳**（它跟界面无关，只是重新同步）
+        on_option(n)     —— 点第 n 个选项
+        on_next()        —— 点「下一题」
+        on_force_read()  —— 强制读屏
+
+    2026-09-28：这里原本还给按键动作盖一个「动作时戳」（`prefetcher.identity()`），
+    执行前拿它跟当前屏幕比、不一样就不点。那个时戳按用户要求取消了 ——
+    理由与真机数据见 tests/test_pipeline.py 里那段注释。
     """
     def on_option(n):
-        queue.put(("numpad", n, prefetcher.identity()))
+        queue.put(("numpad", n))
 
     def on_next():
-        queue.put(("next", None, prefetcher.identity()))
+        queue.put(("next", None))
 
     def on_force_read():
         # 强制读屏的目的就是把程序手里那份旧界面丢掉重读，
-        # 所以它跟「按下时是哪一屏」无关，不盖章。
-        queue.put(("force_read", None, None))
+        # 它跟界面无关，只是重新同步，不需要任何附带信息。
+        queue.put(("force_read", None))
 
     return {
         "on_option": on_option,
@@ -386,7 +378,7 @@ def make_action_putters(queue, prefetcher):
 
 def dispatch_action(action, ctx):
     """
-    执行一个动作队列条目。解包 `(kind, value, stamp)` 后按 kind 分派。
+    执行一个动作队列条目。解包 `(kind, value)` 后按 kind 分派。
 
     做成独立函数（而不是塞在工作线程的闭包里），是为了能单测 ——
     这段「格式对不对、有没有分派错」是最容易悄悄坏掉的地方。
@@ -396,15 +388,15 @@ def dispatch_action(action, ctx):
     宁可什么都不做，也不能把不认识的东西当成「点一下」扔出去。
     """
     try:
-        kind, value, stamp = action
+        kind, value = action
     except (TypeError, ValueError):
-        # 格式不对（不是长度 3 的可解包对象）：直接忽略，不抛异常。
+        # 格式不对（不是长度 2 的可解包对象）：直接忽略，不抛异常。
         # 这是工作线程的最后一道关口 —— 半截元组、None、一个数字之类的东西
         # 不该把线程掀翻，更不该冒出一个「点一下」的副作用。
         return
 
     if kind == "numpad":
-        handle_numpad(value, ctx, stamp=stamp)
+        handle_numpad(value, ctx)
     elif kind == "next":
         handle_next(ctx)
     elif kind == "force_read":
@@ -781,7 +773,7 @@ def handle_speech(text, logprob, ctx):
     do_click(result.node, ctx, description)
 
 
-def handle_numpad(number, ctx, stamp=None):
+def handle_numpad(number, ctx):
     """
     小键盘按下数字：点第 number 个选项。
 
@@ -796,13 +788,9 @@ def handle_numpad(number, ctx, stamp=None):
     读好（见 ScreenPrefetcher），按键时直接用那份结果 —— 坐标依然是系统报的
     当前值，一点没「猜」。只有没预读成时才当场读一次兜底（日志会明说）。
 
-    `stamp`（动作时戳，可为 None）是**按下按键那一刻**的屏幕指纹，由调用方
-    （热键回调）从 ScreenPrefetcher.identity() 取来。这个参数是为了修一个
-    真机上实测到的 bug：在第一题上连按两下 `1`，第一下点完立刻作废缓存并启动
-    后台预读；第二下还在队列里排队，等它被处理时预读已经读回了**第二题**，
-    于是照着第二题点了第 1 个 —— 根子是「第一题时做的动作被用到了第二题上」。
-    真正执行前拿 stamp 跟当前屏幕比一次，不一样就不点。语音路径不盖戳
-    （stamp 为 None），此时不做拦截。
+    按键一律生效，不吞。2026-09-28 之前这里还会核对一个「动作时戳」——
+    按键那一刻记下屏幕指纹，执行前比对，不一样就不点。但真机日志证明它误伤了
+    正常按键，已按用户要求取消；理由与数据见 tests/test_pipeline.py 里那段注释。
     """
     say(f"[小键盘] {number}")
     started = time.monotonic()
@@ -811,14 +799,6 @@ def handle_numpad(number, ctx, stamp=None):
         snap, source = grab_screen(ctx)
     except AdbError as exc:
         say(f"[屏幕] {exc}")
-        return
-
-    # 核对「动作时戳」：这一下是在哪一屏按的？现在要点的又是哪一屏？
-    # 不一样就说明中间翻了页 —— 那这一下绝不能点（会点到新题目上）。
-    if stamp is not None and ScreenPrefetcher.signature(snap) != stamp:
-        say("[小键盘] 这一下已忽略：界面在按键之后翻页了（不点，免得点到新题上）")
-        note_input(ctx, "numpad", str(number),
-                   outcome="已忽略：界面在按键之后翻页了")
         return
 
     if not snap.ok:
@@ -1230,7 +1210,7 @@ def main(argv=None):
         "quit": lambda: hotkeys.quit_requested.set(),
     }
 
-    # 三个按键回调：盖戳 → 入队。盖戳的时机（按键那一刻）封装在 make_action_putters 里。
+    # 三个按键回调：按键那一刻就把动作入队，交给工作线程执行。
     putters = make_action_putters(numpad_queue, ctx["prefetcher"])
 
     if not hotkeys.start(

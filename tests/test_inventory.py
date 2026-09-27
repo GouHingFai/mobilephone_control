@@ -38,7 +38,9 @@ BASELINE_COUNTS = {
     # 动作时戳、意图/唤醒、窗口几何……）。基线贴着实际值。
     # 103 → 106：「下一题」固定坐标路径的前台护栏（peek 返回别的 App / None /
     # GRE3000 三种情形）三条用例。
-    "tests.test_pipeline": 106,
+    # 2026-09-28：删掉 TestActionStamp 的 5 个用例 —— 动作时戳按用户要求取消，
+    # 理由见 tests/test_pipeline.py 里那段注释。
+    "tests.test_pipeline": 101,
     "tests.test_prefetch": 26,
     "tests.test_screen": 27,
     # 7：UiState（线程安全状态黑板）—— 界面与主逻辑唯一的交汇点
@@ -56,8 +58,7 @@ REQUIRED_CLASSES = {
         "TestPrefetchIsTriggeredAfterClick",
         "TestCachedScreenIsUsed",          # 预读的界面要被真正用上
         "TestStartupProbe",                # 启动那一屏要被缓存（省掉第一次读屏）
-        "TestActionStamp",                 # 动作时戳：界面在按键之后翻页了就不点
-        "TestActionWiring",                # 盖戳 → 入队 → 解包分派这条接线
+        "TestActionWiring",                # 入队 → 解包分派这条接线
         "TestForceRead",                   # 小键盘 . 强制重新读屏
         "TestVoiceMutedAfterClick",        # 点完不监听（手机在念单词）
         "TestLogging",

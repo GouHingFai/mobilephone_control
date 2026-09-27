@@ -844,71 +844,16 @@ class TestStartupProbe(unittest.TestCase):
         self.assertIsNone(prefetcher.take(), "读不到就别往缓存里塞东西")
 
 
-class TestActionStamp(unittest.TestCase):
-    """
-    按键动作要带「按键那一刻的屏幕」的戳；执行前核对，屏幕变了就不点。
-
-    由来（真机上实测到的 bug）：在第一题上连按两下 `1`，
-    第一下点完立刻作废缓存并启动后台预读；第二下还在队列里排队，
-    等它被处理时预读已经读回了**第二题**，于是照着第二题点了第 1 个。
-    根子是：**第一题时做的动作，被用到了第二题上。**
-    """
-
-    def _setup(self, xml=GRE_XML):
-        cfg = Config()
-        cfg.prefetch.after_click = False     # 别让后台预读来搅乱
-        cfg.click.settle_ms = 0
-        fake = FakeAdb(xml)
-        pref = app.ScreenPrefetcher(fake, cfg, log=lambda *_: None)
-        pref.note(screen.read_screen(xml))
-        ctx = {
-            "adb": fake,
-            "cfg": cfg,
-            "preview": False,
-            "recognizer": StubRecognizer(),
-            "prefetcher": pref,
-            "voice_gate": StubVoiceGate(),
-            "clicker": Clicker(fake, cfg.click, log=lambda *_: None),
-        }
-        return ctx, fake, pref
-
-    def test_identity_is_none_before_any_read(self):
-        fake = FakeAdb(GRE_XML)
-        pref = app.ScreenPrefetcher(fake, Config(), log=lambda *_: None)
-        self.assertIsNone(pref.identity(), "还没读到过任何界面时不该有指纹")
-
-    def test_identity_reflects_last_seen_screen(self):
-        _ctx, _fake, pref = self._setup()
-        expected = app.ScreenPrefetcher.signature(screen.read_screen(GRE_XML))
-        self.assertEqual(pref.identity(), expected)
-
-    def test_dropped_when_screen_changed_since_press(self):
-        """按键时是第一题，轮到执行时已经翻到第二题 —— 必须不点"""
-        ctx, fake, pref = self._setup()
-        stamp = pref.identity()                     # 按键那一刻：第一题
-        pref.note(screen.read_screen(SECOND_XML))   # 界面翻了页
-        fake.xml = SECOND_XML
-
-        app.handle_numpad(1, ctx, stamp=stamp)
-
-        self.assertEqual(fake.taps, [], "界面已经变了，这一下不能点")
-
-    def test_runs_when_screen_unchanged(self):
-        """界面没翻（比如那一下没生效）—— 照常点，这正是「按错键马上改」要的"""
-        ctx, fake, pref = self._setup()
-        stamp = pref.identity()
-
-        app.handle_numpad(1, ctx, stamp=stamp)
-
-        self.assertEqual(len(fake.taps), 1)
-
-    def test_runs_when_no_stamp_given(self):
-        """没盖戳（比如语音路径）时不做拦截"""
-        ctx, fake, _pref = self._setup()
-
-        app.handle_numpad(1, ctx)
-
-        self.assertEqual(len(fake.taps), 1)
+# 这里曾经有一个 TestActionStamp（动作时戳）—— 2026-09-28 整类删除。
+#
+# 它守的是「按键之后界面翻了页，这一下就别点了」。但真机日志
+# （debug/run_20260927_234859.log）显示它误伤严重：9 次「已忽略」里 7 次
+# 用户按的是**不同的键**，是在答下一题。根因是时戳取「程序最近见过的那一屏」，
+# 而那一刻程序自己已经落后，旧屏 ≠ 用户眼前的屏 ——
+# 它比的不是「屏幕变了没有」，而是「程序自己有没有跟上」。
+#
+# 用户明确要求：按键一律生效，不要吞。（他自评「误触概率很小」。）
+# 若将来「连按两下同一个键点到新题」真的复现，再考虑加「只挡同一个键的短时重复」那道轻拦。
 
 
 class RecordingQueue:
@@ -923,68 +868,65 @@ class RecordingQueue:
 
 class TestActionWiring(unittest.TestCase):
     """
-    「盖戳 → 入队 → 解包分派」这条接线。
+    「入队 → 解包分派」这条接线。
 
-    上一轮只测了后半截「核对时戳」（见 TestActionStamp），
-    而把时戳**做出来、送进队列、再从队列里分派出去**这段，原本写在
-    main() 的三个 lambda 和一个闭包里，外部调不到 ——
-    于是谁把它改坏了（比如忘带戳、把两元组当三元组解、把分派写反），
-    227 个测试照样全绿，而真机上「连按两下点到新题」原样复现。
+    这段原本写在 main() 的三个 lambda 和一个闭包里，外部调不到 ——
+    于是谁把它改坏了（忘带值、把二元组当三元组解、把分派写反），
+    几百个测试照样全绿，而真机上就是「按了没反应 / 点到别的地方」。
 
     所以现在这段被抽成 make_action_putters / dispatch_action 两个模块级函数，
     在这里直接钉住它的**可观察后果**（队列里真有那条、真的点了那一下），
     而不是去 monkeypatch 模块级处理函数 —— 那样测到的是桩，不是接线。
+
+    2026-09-28：入队格式从「带动作时戳的三元组」改回**二元组** `(kind, value)`，
+    时戳整个取消 —— 下面这些用例跟着去掉了所有跟戳有关的断言。
+    取消的理由见本文件里那段注释。
     """
 
-    # ---------------------------------------------------------- 盖戳
+    # ---------------------------------------------------------- 入队
 
     def _prefetcher_with(self, xml=GRE_XML):
-        """造一个已经「见过一屏」的真 ScreenPrefetcher"""
+        """造一个已经「见过一屏」的真 ScreenPrefetcher（入队已用不到它，留作参数稳定）"""
         cfg = Config()
         fake = FakeAdb(xml)
         pref = app.ScreenPrefetcher(fake, cfg, log=lambda *_: None)
         pref.note(screen.read_screen(xml))
         return pref
 
-    def test_on_option_puts_number_with_the_stamp(self):
+    def test_on_option_puts_the_number(self):
         pref = self._prefetcher_with()
-        expected = app.ScreenPrefetcher.signature(screen.read_screen(GRE_XML))
         q = RecordingQueue()
 
         app.make_action_putters(q, pref)["on_option"](3)
 
-        self.assertEqual(q.items, [("numpad", 3, expected)],
-                         "点选项要入队三元组 (\"numpad\", 几号, 按键时的屏幕指纹)")
+        self.assertEqual(q.items, [("numpad", 3)],
+                         "点选项要入队二元组 (\"numpad\", 几号)")
 
-    def test_on_next_puts_next_with_the_stamp(self):
+    def test_on_next_puts_next(self):
         pref = self._prefetcher_with()
-        expected = app.ScreenPrefetcher.signature(screen.read_screen(GRE_XML))
         q = RecordingQueue()
 
         app.make_action_putters(q, pref)["on_next"]()
 
-        self.assertEqual(q.items, [("next", None, expected)],
-                         "「下一题」也要带戳 —— 它一样会点到新界面上")
+        self.assertEqual(q.items, [("next", None)])
 
-    def test_on_force_read_has_no_stamp(self):
-        """强制读屏跟界面无关，不带戳（带了反而会被误拦）"""
+    def test_on_force_read(self):
+        """强制读屏只带一个 kind，值位留 None —— 别再挂什么附带信息"""
         pref = self._prefetcher_with()
         q = RecordingQueue()
 
         app.make_action_putters(q, pref)["on_force_read"]()
 
-        self.assertEqual(q.items, [("force_read", None, None)])
+        self.assertEqual(q.items, [("force_read", None)])
 
-    def test_stamp_is_taken_at_press_not_at_execution(self):
+    def test_number_is_captured_at_press_not_at_execution(self):
         """
-        戳必须在**按下那一刻**取。
+        按下的号码必须在**按下那一刻**就定格进队列。
 
-        这条正是那个真机 bug 的要点：按下的那一屏，和轮到执行时的屏幕，
-        中间可能已经翻过页了。戳要是取晚了（比如在工作线程里才取），
-        它就会等于「新那一屏」，核对时永远相等，等于没拦。
+        它不跟屏幕挂钩（所以按完再翻页也不该把它改掉），但它是「这一下要点第几号」——
+        入队要是取晚了、或者拖到工作线程里才决定，用户按的 2 就可能变成别的数。
         """
         pref = self._prefetcher_with()
-        pressed = pref.identity()                    # 按下那一刻：第一题
         q = RecordingQueue()
         putters = app.make_action_putters(q, pref)
 
@@ -992,18 +934,23 @@ class TestActionWiring(unittest.TestCase):
 
         pref.note(screen.read_screen(SECOND_XML))     # 按完才翻页
 
-        self.assertEqual(q.items[0], ("numpad", 2, pressed),
-                         "戳是按下时的屏幕，事后翻页不该把它改掉")
+        self.assertEqual(q.items[0], ("numpad", 2),
+                         "队列里要钉住按下时那个号码，事后翻页不该把它改掉")
 
-    def test_stamp_is_none_before_any_screen_read(self):
-        """还没读到过任何界面时，戳就是 None —— 别硬编个假的出来"""
-        pref = self._prefetcher_with()
-        pref._last_seen = None
+    def test_putters_do_not_need_the_prefetcher(self):
+        """
+        按键回调不再依赖预读器 —— 传 None 也照样入队。
+
+        这是取消时戳的直接后果：以前 `on_option`/`on_next` 要在按下的那一刻
+        调 `prefetcher.identity()` 取屏幕指纹，所以非有预读器不可；
+        现在它们只是把动作排进队列。`prefetcher` 参数保留只是为了签名稳定，
+        哪天真又需要看屏幕了，这条测试会提醒你一起改。
+        """
         q = RecordingQueue()
 
-        app.make_action_putters(q, pref)["on_option"](1)
+        app.make_action_putters(q, None)["on_option"](1)
 
-        self.assertIsNone(q.items[0][2])
+        self.assertEqual(q.items, [("numpad", 1)])
 
     # ---------------------------------------------------------- 解包分派
 
@@ -1012,7 +959,7 @@ class TestActionWiring(unittest.TestCase):
         ctx, fake = make_ctx(GRE_XML)
         ctx["cfg"].click.debounce_ms = 0
 
-        app.dispatch_action(("numpad", 1, None), ctx)
+        app.dispatch_action(("numpad", 1), ctx)
 
         self.assertEqual(len(fake.taps), 1, "numpad 动作应该真点一下")
         _, y = fake.taps[0]
@@ -1022,7 +969,7 @@ class TestActionWiring(unittest.TestCase):
         """next 动作去点「下一题」，而不是被当成点选项"""
         ctx, fake = make_ctx(DETAIL_XML)
 
-        app.dispatch_action(("next", None, None), ctx)
+        app.dispatch_action(("next", None), ctx)
 
         self.assertEqual(fake.taps, [(600, 2180)],
                          "next 应该点到「下一题」按钮中心")
@@ -1031,42 +978,27 @@ class TestActionWiring(unittest.TestCase):
         """force_read 只重读一次屏，不点任何东西"""
         ctx, fake = make_ctx(GRE_XML)
 
-        app.dispatch_action(("force_read", None, None), ctx)
+        app.dispatch_action(("force_read", None), ctx)
 
         self.assertEqual(fake.dump_calls, 1, "强制读屏应该当场读一次")
         self.assertEqual(fake.taps, [], "强制读屏不该顺带点东西")
 
-    def test_dispatch_does_not_swallow_the_stamp(self):
+    def test_dispatch_passes_the_value_through(self):
         """
-        分派时必须把戳**原样传给** handle_numpad。
+        分派时必须把号數**原样传给** handle_numpad。
 
-        这里让界面在按键后翻了页：戳对不上就该不点。
-        要是 dispatch_action 忘了传 stamp（比如写成 handle_numpad(value, ctx)），
-        这一下就会照点不误 —— 真机上就是「连按两下点到新题」。
+        要是 dispatch_action 把第二个元素弄丢或弄错（比如写成 handle_numpad(ctx)），
+        按 2 就会点到别的选项上。这里按 2，就该落在第 2 个选项的坐标上。
         """
-        cfg = Config()
-        cfg.prefetch.after_click = False
-        cfg.click.settle_ms = 0
-        fake = FakeAdb(GRE_XML)
-        pref = app.ScreenPrefetcher(fake, cfg, log=lambda *_: None)
-        pref.note(screen.read_screen(GRE_XML))
-        ctx = {
-            "adb": fake,
-            "cfg": cfg,
-            "preview": False,
-            "recognizer": StubRecognizer(),
-            "prefetcher": pref,
-            "voice_gate": StubVoiceGate(),
-            "clicker": Clicker(fake, cfg.click, log=lambda *_: None),
-        }
-        action = ("numpad", 1, pref.identity())      # 按下时：第一题
+        ctx, fake = make_ctx(GRE_XML)
+        ctx["cfg"].click.debounce_ms = 0
+        expected_y = screen.read_screen(GRE_XML).options[1].y
 
-        pref.note(screen.read_screen(SECOND_XML))    # 翻到第二题
-        fake.xml = SECOND_XML
+        app.dispatch_action(("numpad", 2), ctx)
 
-        app.dispatch_action(action, ctx)
-
-        self.assertEqual(fake.taps, [], "界面已变，这一下不能点 —— 戳必须传到")
+        self.assertEqual(len(fake.taps), 1)
+        self.assertEqual(fake.taps[0][1], expected_y,
+                         "按 2 应该点到第 2 个选项，说明号數被原样传到了")
 
     # ---------------------------------------------------------- 坏格式不崩
 
@@ -1080,13 +1012,13 @@ class TestActionWiring(unittest.TestCase):
         bad_actions = [
             3,                      # 根本不是可迭代对象
             None,
-            ("numpad",),            # 太短
-            ("numpad", 1),          # 少了戳
-            ("numpad", 1, None, 2), # 太长
+            ("numpad",),            # 太短：缺了号码
+            ("numpad", 1, None),    # 太长：三元组是上一版带动作时戳的格式，现在不认了
+            ("numpad", 1, None, 2), # 更长
             (),
-            "numpad",               # 字符串（会被逐字符拆开，但长度也不对）
-            "abc",                  # 长度 3 的字符串：解出来 kind 认不出，也不该点
-            "abcdef",
+            "numpad",               # 字符串（会被逐字符拆开，长度也不对）
+            "ab",                   # 长度 2 的字符串：解出来 kind 认不出，也不该点
+            "abc",                  # 长度 3：解包时值太多，同样不认
         ]
 
         for bad in bad_actions:
@@ -1099,7 +1031,7 @@ class TestActionWiring(unittest.TestCase):
         """将来加了 kind 而分支没跟上时，宁可什么都不做，也不能乱点"""
         ctx, fake = make_ctx(GRE_XML)
 
-        app.dispatch_action(("nonsense", 1, None), ctx)
+        app.dispatch_action(("nonsense", 1), ctx)
 
         self.assertEqual(fake.taps, [])
 
@@ -1626,8 +1558,16 @@ class TestUiStateWiring(unittest.TestCase):
         self.assertTrue(any("已跳过" in o for o in outcomes),
                         f"被挡掉的那一下要记成「已跳过」，实际记的是 {outcomes!r}")
 
-    def test_stamp_rejected_press_leaves_an_ignored_record(self):
-        """按键后界面翻了页、这一下被时戳拦下 —— 界面要写明「已忽略」"""
+    def test_press_still_clicks_after_the_screen_turned(self):
+        """
+        按下那一刻是第一题，轮到执行时界面已经翻到下一题 —— 这一下照样点。
+
+        这正是 2026-09-28 取消动作时戳要保住的行为：那套时戳拿「按下时的屏幕」
+        跟「执行时的屏幕」比，不一样就吞掉，结果误伤了大量正常按键
+        （真机数据与理由是 test_pipeline.py 里那段注释）。这条走的是**真接线**：
+        按键 → 入队 → 翻页 → 出队执行 —— 谁要是又把「比一比、不一样就吞」
+        加回来，它会立刻变红。
+        """
         cfg = Config()
         cfg.prefetch.after_click = False     # 别让后台预读来搅乱
         cfg.click.settle_ms = 0
@@ -1644,16 +1584,23 @@ class TestUiStateWiring(unittest.TestCase):
             "clicker": Clicker(fake, cfg.click, log=lambda *_: None),
             "ui": UiState(),
         }
-        stamp = pref.identity()                       # 按下那一刻：第一题
-        pref.note(screen.read_screen(SECOND_XML))    # 轮到执行时已经翻页
+        q = RecordingQueue()
+
+        # 用户按下 1（此刻屏幕上还是第一题），动作进了队列
+        app.make_action_putters(q, pref)["on_option"](1)
+        # 还没轮到执行，界面就翻了页（用户接着在答下一题）
+        pref.note(screen.read_screen(SECOND_XML))
         fake.xml = SECOND_XML
 
-        app.handle_numpad(1, ctx, stamp=stamp)
+        for action in q.items:                 # 工作线程把队列里的动作取出来执行
+            app.dispatch_action(action, ctx)
 
-        self.assertEqual(fake.taps, [], "界面已经变了，这一下不能点")
+        self.assertEqual(len(fake.taps), 1, "翻页之后轮到执行，这一下也要生效，不能吞")
         outcomes = self._recent_outcomes(ctx)
-        self.assertTrue(any("已忽略" in o for o in outcomes),
-                        f"被时戳拦下的那一下要记成「已忽略」，实际记的是 {outcomes!r}")
+        self.assertTrue(any("第 1 个" in o for o in outcomes),
+                        f"这一下要如实记成点了第 1 个，实际记的是 {outcomes!r}")
+        self.assertFalse(any("已忽略" in o for o in outcomes),
+                         f"不该再有「已忽略」这种出路，实际记的是 {outcomes!r}")
 
     # ------------------------------------------- 语音留下「听到了什么」
 
