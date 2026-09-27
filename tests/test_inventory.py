@@ -32,10 +32,15 @@ BASELINE_COUNTS = {
     # 免得整类被删掉时用例数还高于基线、单靠数字发现不了。
     "tests.test_config": 34,
     "tests.test_hotkey": 25,
-    "tests.test_matcher": 51,
-    "tests.test_pipeline": 59,
+    # 51 → 53：补上控制语识别的 TestDetectControl（说「下一题」走哪条路）
+    "tests.test_matcher": 53,
+    # 59 → 103：界面与语音「下一题」那一期加进来的用例（UiState 接线、
+    # 动作时戳、意图/唤醒、窗口几何……）。基线贴着实际值。
+    "tests.test_pipeline": 103,
     "tests.test_prefetch": 26,
     "tests.test_screen": 27,
+    # 7：UiState（线程安全状态黑板）—— 界面与主逻辑唯一的交汇点
+    "tests.test_ui_state": 7,
     "tests.test_voice_gate": 11,
 }
 
@@ -54,15 +59,20 @@ REQUIRED_CLASSES = {
         "TestForceRead",                   # 小键盘 . 强制重新读屏
         "TestVoiceMutedAfterClick",        # 点完不监听（手机在念单词）
         "TestLogging",
-        # 下面这几个整类删掉时，剩余用例数仍高于基线（72→65 > 59），
-        # 单靠用例数发现不了 —— 但它们钉的是界面的开关能不能真的生效、
-        # 以及主循环的循环体本身。正是 test_inventory「防悄悄失去保护」的立意所在。
+        # 下面这一批钉的是界面那几块拼图与主循环本身。它们都不是「多一个点错的
+        # 风险」那种防线，而是「界面到底有没有接上、开关能不能真的生效」——
+        # 删掉任何一个，真机上都会表现成「界面永远空着 / 按钮没反应」，
+        # 而普通用例往往照样全绿。所以这里按**名字**把它们钉住：
+        # 即便有人改名换成一个等量的无关测试、总数对得上，这一条也会红。
+        "TestRunVoiceLoop",                # 主循环能被抽出来单独跑（界面要占主线程）
         "TestRunVoiceLoopBranches",        # 主循环循环体的各条分支
         "TestHandleIntent",                # 界面按钮与热键走同一份代码
         "TestToggleFlag",                  # 界面上的预读／语音下一题开关
         "TestAnyEvent",                    # 退出请求与唤醒合成一个中断源
-        # 整个类删掉时用例数仍高于基线（现在远超 59），单靠数字发现不了 ——
-        # 而它钉的是「窗口位置存了能读回来」这件只有真机才验得了的事。
+        "TestVoiceNextCommand",            # 说「下一题」= 点下一题
+        "TestCollectState",                # 界面显示的数据来源
+        "TestUiStateWiring",               # 主流程有没有真的把数据交给界面
+        "TestUiWiringWithoutUi",           # 没开界面时一切照旧
         "TestWindowGeometry",              # 窗口几何的存／读／坏值兜底
     ],
     "tests.test_screen": [
@@ -76,6 +86,10 @@ REQUIRED_CLASSES = {
         "TestStemMatch",                   # 英语词形（原形 vs 变形）
         "TestAmbiguity",                   # 多候选怎么取舍
         "TestNoMatch",                     # 匹配不上就不点
+        "TestDetectControl",               # 控制语识别（「下一题」走直给那条路）
+    ],
+    "tests.test_ui_state": [
+        "TestIntents",                     # 界面 → 主逻辑的意图队列
     ],
     "tests.test_prefetch": [
         "TestInvalidateKeepsSignature",    # 作废缓存不能连指纹一起清掉

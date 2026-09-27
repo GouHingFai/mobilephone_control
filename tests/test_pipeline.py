@@ -481,6 +481,27 @@ class TestNextButton(unittest.TestCase):
         app.handle_next(ctx)
         self.assertEqual(len(fake.taps), 2)
 
+    def test_next_click_is_recorded_as_next_not_speech(self):
+        """
+        「下一题」这一下，界面「我的输入」里必须标成 next（标签 0），不能标成 speech。
+
+        由来（任务 6 审查实测）：把 `_input_kind_and_label` 里
+        「`("next",)` → `kind="next"`」那一支改成 `speech`，**307 条用例照样全绿** ——
+        也就是说小键盘 0 / 语音「下一题」这条点击的来源标签零覆盖，
+        真标错了界面上会把「按了 0」显示成一次语音输入，而没人拦得住。
+        """
+        ctx, fake = make_ctx(DETAIL_XML, ui=UiState())
+        ctx["cfg"].click.settle_ms = 0
+        ctx["cfg"].hotkey.fixed_next_position = (909, 2476)
+
+        app.handle_next(ctx)
+
+        self.assertEqual(len(fake.taps), 1, "先确认这一下真的点了")
+        events = ctx["ui"].recent_inputs()
+        self.assertTrue(events, "点完之后界面要能看见「我的输入」")
+        self.assertEqual(events[0].kind, "next", "这一下是「下一题」，不能标成别的种类")
+        self.assertEqual(events[0].label, "0")
+
 
 class TestPrefetchIsTriggeredAfterClick(unittest.TestCase):
     """
