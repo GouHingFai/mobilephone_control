@@ -46,6 +46,8 @@ REQUIRED_CLASSES = {
         "TestPrefetchIsTriggeredAfterClick",
         "TestCachedScreenIsUsed",          # 预读的界面要被真正用上
         "TestStartupProbe",                # 启动那一屏要被缓存（省掉第一次读屏）
+        "TestActionStamp",                 # 动作时戳：界面在按键之后翻页了就不点
+        "TestActionWiring",                # 盖戳 → 入队 → 解包分派这条接线
         "TestForceRead",                   # 小键盘 . 强制重新读屏
         "TestVoiceMutedAfterClick",        # 点完不监听（手机在念单词）
         "TestLogging",
