@@ -408,6 +408,11 @@ def dispatch_action(action, ctx):
         handle_next(ctx)
     elif kind == "force_read":
         handle_force_read(ctx)
+    elif kind == "intent":
+        # 界面按钮的动作。唤醒事件从 ctx 里取，不必给本函数加参数。
+        handle_intent(value, ctx, ctx.get("wake_event"))
+    elif kind == "quit":
+        ctx["hotkeys"].quit_requested.set()
 
 
 # ---------------------------------------------------------------- 主流程
@@ -477,6 +482,49 @@ def probe_startup_screen(adb, prefetcher, log=say):
     return snap
 
 
+class _AnyEvent:
+    """
+    把「任意一个事件被置位」伪装成**单个** Event，喂给监听函数。
+
+    `listen_until_silence()` 只接受一个 stop_event，但我们有两个中断源：
+    退出请求、以及「开关变了、快回来看一眼」。它内部只调 `is_set()`，
+    所以这么一个小壳子就够了，不必去改音频层。
+    """
+
+    def __init__(self, *events):
+        self._events = events
+
+    def is_set(self):
+        return any(e.is_set() for e in self._events)
+
+
+def _toggle_flag(ctx, section, key, label):
+    """翻一下配置里的某个布尔开关，并打一行日志。界面上那两个开关走这里。"""
+    obj = getattr(ctx["cfg"], section)
+    setattr(obj, key, not getattr(obj, key))
+    say(f"  >>> {label}：{'开' if getattr(obj, key) else '关'}")
+
+
+def handle_intent(name, ctx, wake_event=None):
+    """
+    执行一个来自界面的意图。
+
+    真正的动作都在 `ctx["intents"]` 那张表里，而那张表里放的就是热键回调
+    本身 —— 所以「界面点」和「按热键」走的是同一份代码。
+
+    执行完唤醒一下监听线程：它多半正阻塞在「等你说话」上，
+    不叫醒它，切模式／开关语音就要等到你下次开口才生效。
+    """
+    action = ctx.get("intents", {}).get(name)
+    if action is None:
+        return
+    try:
+        action()
+    finally:
+        if wake_event is not None:
+            wake_event.set()
+
+
 def do_click(node, ctx, description, key=None):
     """
     所有点击的唯一出口：打日志 → 点 → 作废缓存 → 后台预读下一屏。
@@ -523,12 +571,15 @@ def report_unusable_screen(snap):
     show_screen(snap)
 
 
-def run_voice_loop(ctx, hotkeys, recognizer, once=False):
+def run_voice_loop(ctx, hotkeys, recognizer, once=False, wake_event=None):
     """
     主循环：听 → 识别 → 点击。
 
     抽成独立函数，是为了让界面能占主线程（Tkinter 的硬性要求）。
     不带 --gui 时它仍旧跑在主线程，行为与以前完全一致。
+
+    `wake_event` 是界面那边用来「叫醒」它的：监听线程大部分时间阻塞在
+    「等你说话」上，界面点了开关得能让它立刻回来看一眼（见 handle_intent）。
     """
     while not hotkeys.quit_requested.is_set():
         if ctx["mode"] == "listen":
@@ -537,9 +588,17 @@ def run_voice_loop(ctx, hotkeys, recognizer, once=False):
                 time.sleep(0.1)
                 continue
             ctx["voice_gate"].wait_until_open(hotkeys.quit_requested)
+            if wake_event is not None:
+                # 进监听前清零 —— 否则上一次留下的置位会立刻把这次等待打断，变成空转
+                wake_event.clear()
+            # 两个中断源合成一个：退出请求、以及「开关变了、快回来看一眼」。
+            # 音频层每 50 毫秒查一次 is_set()，所以关窗口也能立刻退出。
+            stop = (_AnyEvent(hotkeys.quit_requested, wake_event)
+                    if wake_event is not None else hotkeys.quit_requested)
             utterance = recognizer.listen_once(
                 on_speech_start=ctx["prefetcher"].trigger_on_speech,
                 hint_snapshot=ctx["prefetcher"].peek(),
+                stop_event=stop,
             )
         else:
             # 等按下 F8；没按下就继续空转
@@ -929,6 +988,11 @@ def main(argv=None):
     # --- 热键
     section("准备热键")
     hotkeys = HotkeyManager(cfg.hotkey, log=say)
+    # 工作线程要用它们（分发 "intent" 时会读 ctx["hotkeys"] / ctx["wake_event"]），
+    # 所以必须赶在 numpad_worker 那个线程启动之前建好。
+    ctx["hotkeys"] = hotkeys
+    wake_event = threading.Event()
+    ctx["wake_event"] = wake_event
 
     # 小键盘走独立工作线程，不放在主循环里。
     # 因为常驻监听模式下主循环会一直阻塞在「等你说话」上，
@@ -963,6 +1027,22 @@ def main(argv=None):
 
     def voice_toggle():
         ctx["voice_gate"].toggle()
+
+    # 界面要用的意图表。**表里放的就是上面这些热键回调本身** ——
+    # 于是「界面点一下」和「按一下热键」走的是同一份代码，不会出现
+    # 「界面显示开着、实际没开」这种分裂。
+    #
+    # 注意：这张表得建在 toggle_mode / voice_toggle **定义之后**，
+    # 因为它引用的就是这两个函数。
+    ctx["intents"] = {
+        "toggle_voice": voice_toggle,
+        "toggle_mode": toggle_mode,
+        "toggle_numpad": lambda: hotkeys.set_numpad(not hotkeys.numpad_enabled),
+        "toggle_prefetch": lambda: _toggle_flag(ctx, "prefetch", "after_click", "点击后预读"),
+        "toggle_voice_next": lambda: _toggle_flag(ctx, "voice", "next_command", "语音说「下一题」"),
+        "force_read": lambda: handle_force_read(ctx),
+        "quit": lambda: hotkeys.quit_requested.set(),
+    }
 
     # 三个按键回调：盖戳 → 入队。盖戳的时机（按键那一刻）封装在 make_action_putters 里。
     putters = make_action_putters(numpad_queue, ctx["prefetcher"])

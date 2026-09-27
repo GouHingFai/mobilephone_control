@@ -127,6 +127,10 @@ class StubPrefetcher:
     def note(self, snap, read_at=None):
         self.noted += 1
 
+    def peek(self):
+        """看一眼最近见过的界面（不消费）—— 主循环要拿它当识别的提示词"""
+        return None
+
     def trigger_after_click(self):
         self.after_click_triggers += 1
 
@@ -1056,12 +1060,53 @@ class TestVoiceNextCommand(unittest.TestCase):
         self.assertEqual(fake.taps, [], "关掉之后不该点；应落回普通匹配并提示详情页")
 
 
+class QuitAfterNCalls:
+    """
+    假的 `quit_requested`：被 `is_set()` 问到第 N 次时回答「是」。
+
+    主循环是 `while not hotkeys.quit_requested.is_set()`，只要不置位就永远转下去。
+    要驱动那些**这一圈不会自己退出**的分支（喂 None、喂空串、语音关掉），
+    与其另起一个线程去掐它，不如让这个假事件自己数圈数 —— 数够就走。
+    于是这类用例是确定性的、毫秒级结束的，也不会出现「挂死」这种最难看的红。
+    """
+
+    def __init__(self, n):
+        self._n = n
+        self.asked = 0          # 被问了几次（= 循环回到顶部几次）
+
+    def is_set(self):
+        self.asked += 1
+        return self.asked >= self._n
+
+
 class StubHotkeys:
     """最小可用的热键替身：主循环只需要这两个事件"""
 
-    def __init__(self):
-        self.quit_requested = threading.Event()
+    def __init__(self, quit_after=None):
+        # quit_after=N 时改用「问够 N 次才置位」的假事件，方便驱动循环体（见 QuitAfterNCalls）
+        self.quit_requested = (QuitAfterNCalls(quit_after) if quit_after
+                               else threading.Event())
         self.ptt_pressed = threading.Event()
+
+
+class StubRecognizerLoop:
+    """只记录被怎么调用的假识别器 —— 用来驱动主循环的各条分支"""
+
+    last_timing = {}
+
+    def __init__(self, utterances=None):
+        self.utterances = list(utterances or [])
+        self.calls = []          # [("listen_once", kwargs) | ("listen_pressed", kwargs)]
+        self.held_events = []    # listen_pressed 收到的第一个实参（「正在按住」那个事件）
+
+    def listen_once(self, **kwargs):
+        self.calls.append(("listen_once", kwargs))
+        return self.utterances.pop(0) if self.utterances else None
+
+    def listen_pressed(self, held_event, **kwargs):
+        self.calls.append(("listen_pressed", kwargs))
+        self.held_events.append(held_event)
+        return self.utterances.pop(0) if self.utterances else None
 
 
 class TestRunVoiceLoop(unittest.TestCase):
@@ -1080,6 +1125,209 @@ class TestRunVoiceLoop(unittest.TestCase):
                 raise AssertionError("已经请求退出了，不该再去监听")
 
         app.run_voice_loop(ctx, hotkeys, MustNotBeCalled(), once=False)
+
+
+class TestRunVoiceLoopBranches(unittest.TestCase):
+    """
+    主循环的**循环体**也要被真的驱动到。
+
+    为什么单开这一类：上面那条 `TestRunVoiceLoop` 只钉住了「入口条件」——
+    把 `run_voice_loop` 的循环体整段删空、只留 `return`，它照样绿
+    （`quit_requested` 已置位，`while` 根本不进）。也就是说那时的「全绿」
+    对循环体是**零约束**，而「加 wake_event」这一步马上要动这个函数。
+
+    所以这里用假识别器 + 假热键把循环真的转起来，**每条分支配一个能变红的断言**。
+    不起真线程、不碰真音频。
+
+    两个假事件的分工：
+      - `QuitAfterNCalls` 让「这一圈不会自己退出」的用例跑够圈数后自己收尾；
+      - `StubRecognizerLoop` 按喂进去的台词回答，并记下自己被怎么调用。
+    """
+
+    def _ctx(self, xml=GRE_XML, mode="listen"):
+        ctx, fake = make_ctx(xml)
+        ctx["mode"] = mode
+        return ctx, fake
+
+    # ---------------------------------------------------------- listen 模式
+
+    def test_listen_mode_goes_through_listen_once(self):
+        """常驻监听：走 listen_once，带上「屏幕提示词」与「开口了」回调，然后真的点一下"""
+        ctx, fake = self._ctx()
+        recognizer = StubRecognizerLoop([("清晰", -0.4)])
+        hotkeys = StubHotkeys(quit_after=3)
+
+        app.run_voice_loop(ctx, hotkeys, recognizer, once=True)
+
+        kind, kwargs = recognizer.calls[0]
+        self.assertEqual(kind, "listen_once")
+        self.assertIn("hint_snapshot", kwargs, "要拿屏幕上的选项当提示词喂给识别")
+        self.assertIn("on_speech_start", kwargs, "要能感知「你开口了」去触发预读")
+        self.assertEqual(len(fake.taps), 1, "喂进去的那一句应该被真的点掉")
+
+    def test_voice_off_short_circuits_before_listening(self):
+        """语音关着（F7）时连监听都不该进 —— 省得白忙一场"""
+        ctx, fake = self._ctx()
+        recognizer = StubRecognizerLoop([("清晰", -0.4)])
+        hotkeys = StubHotkeys(quit_after=2)
+        ctx["voice_gate"].enabled = False
+
+        app.run_voice_loop(ctx, hotkeys, recognizer)
+
+        self.assertEqual(recognizer.calls, [], "语音关着还去监听，就是白等一次说话")
+        self.assertEqual(fake.taps, [])
+
+    # ---------------------------------------------------------- hotkey 模式
+
+    def test_hotkey_mode_goes_through_listen_pressed(self):
+        """按住说话：走 listen_pressed，且把「正在按住」那个事件原样传下去"""
+        ctx, fake = self._ctx(mode="hotkey")
+        recognizer = StubRecognizerLoop([("清晰", -0.4)])
+        hotkeys = StubHotkeys(quit_after=3)
+        hotkeys.ptt_pressed.set()      # 先按住，否则这一圈会在 wait(0.2) 上白等
+
+        app.run_voice_loop(ctx, hotkeys, recognizer, once=True)
+
+        kind, kwargs = recognizer.calls[0]
+        self.assertEqual(kind, "listen_pressed")
+        self.assertIs(recognizer.held_events[0], hotkeys.ptt_pressed,
+                      "必须把「正在按住」那个事件原样传下去，否则松开也停不下来")
+        self.assertIn("hint_snapshot", kwargs)
+        self.assertEqual(len(fake.taps), 1)
+
+    # ---------------------------------------------------------- 跳过这一句
+
+    def test_none_utterance_keeps_looping_without_clicking(self):
+        """识别返回 None（没听清）—— 不点，回到顶部接着听下一句"""
+        ctx, fake = self._ctx()
+        recognizer = StubRecognizerLoop([None])
+        hotkeys = StubHotkeys(quit_after=2)
+
+        app.run_voice_loop(ctx, hotkeys, recognizer)
+
+        self.assertEqual(fake.taps, [], "没听清绝不能点")
+        self.assertEqual(fake.dump_calls, 0, "没听清就不用读屏")
+        self.assertEqual(hotkeys.quit_requested.asked, 2,
+                         "应该回到 while 顶部接着听（被问第二次说明真的转了一圈）")
+
+    def test_blank_text_is_skipped_without_clicking(self):
+        """识别成一片空白（只有空格）—— 跳过，别当成一句话去匹配"""
+        ctx, fake = self._ctx()
+        recognizer = StubRecognizerLoop([("   ", -0.4)])
+        hotkeys = StubHotkeys(quit_after=2)
+
+        app.run_voice_loop(ctx, hotkeys, recognizer)
+
+        self.assertEqual(fake.taps, [], "空话不能点")
+        self.assertEqual(fake.dump_calls, 0, "空话连屏都不用读")
+        self.assertEqual(hotkeys.quit_requested.asked, 2, "应该回到 while 顶部继续下一圈")
+
+    # ---------------------------------------------------------- 兜底与收尾
+
+    def test_adb_error_is_absorbed_and_loop_survives(self):
+        """读屏失败（比如手机掉了）—— 记下来，循环照常转，不崩"""
+        ctx, _fake = self._ctx()
+
+        class BrokenAdb:
+            """除了读屏会炸，别的照旧 —— 主循环的兜底就是为它写的"""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def dump_ui(self, retries=3, retry_wait=0.4):
+                raise AdbError("假装手机掉线了")
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        real = ctx["adb"]
+        ctx["adb"] = BrokenAdb(real)
+        recognizer = StubRecognizerLoop([("清晰", -0.4)])
+        hotkeys = StubHotkeys(quit_after=3)
+
+        app.run_voice_loop(ctx, hotkeys, recognizer, once=True)
+
+        self.assertEqual(len(recognizer.calls), 1, "循环应该照常走完这一句")
+        self.assertEqual(real.taps, [], "读屏都失败了，这一句不可能点成")
+
+    def test_once_returns_after_a_single_utterance(self):
+        """--once：跑完一句就真的返回，不再听第二句"""
+        ctx, fake = self._ctx()
+        recognizer = StubRecognizerLoop([("清晰", -0.4)])
+        # quit_after=3 是护栏：万一 break 没了，循环会在数到 3 时退出，
+        # 于是下面「只调了一次」的断言变红 —— 而不是把这个用例挂死在那儿。
+        hotkeys = StubHotkeys(quit_after=3)
+
+        app.run_voice_loop(ctx, hotkeys, recognizer, once=True)
+
+        self.assertEqual(len(recognizer.calls), 1,
+                         "once 模式跑完一句就该退出，不该再听一轮")
+        self.assertEqual(len(fake.taps), 1)
+
+
+class TestHandleIntent(unittest.TestCase):
+    """
+    界面按钮走这里。**调的必须是和热键完全相同的函数** ——
+    不写第二套逻辑，否则会出现「界面显示开着、实际没开」这种分裂。
+    """
+
+    def _ctx(self):
+        cfg = Config()
+        calls = []
+        ctx = {
+            "cfg": cfg,
+            "intents": {
+                "toggle_voice": lambda: calls.append("voice"),
+                "toggle_mode": lambda: calls.append("mode"),
+            },
+        }
+        return ctx, calls
+
+    def test_dispatches_to_the_same_function(self):
+        ctx, calls = self._ctx()
+        app.handle_intent("toggle_voice", ctx)
+        self.assertEqual(calls, ["voice"])
+
+    def test_unknown_intent_is_ignored(self):
+        ctx, calls = self._ctx()
+        app.handle_intent("乱写的名字", ctx)
+        self.assertEqual(calls, [])
+
+    def test_wakes_the_listener_afterwards(self):
+        ctx, _calls = self._ctx()
+        wake = threading.Event()
+
+        app.handle_intent("toggle_voice", ctx, wake_event=wake)
+
+        self.assertTrue(wake.is_set(), "执行完要唤醒监听线程，开关才会立刻生效")
+
+
+class TestToggleFlag(unittest.TestCase):
+    """界面上那两个没有对应热键的开关（预读、语音下一题）"""
+
+    def test_flips_and_flips_back(self):
+        ctx = {"cfg": Config()}
+
+        app._toggle_flag(ctx, "prefetch", "after_click", "点击后预读")
+        self.assertFalse(ctx["cfg"].prefetch.after_click)
+
+        app._toggle_flag(ctx, "prefetch", "after_click", "点击后预读")
+        self.assertTrue(ctx["cfg"].prefetch.after_click)
+
+    def test_works_on_voice_next(self):
+        ctx = {"cfg": Config()}
+        app._toggle_flag(ctx, "voice", "next_command", "语音说「下一题」")
+        self.assertFalse(ctx["cfg"].voice.next_command)
+
+
+class TestAnyEvent(unittest.TestCase):
+
+    def test_true_if_any_set(self):
+        a, b = threading.Event(), threading.Event()
+        any_event = app._AnyEvent(a, b)
+        self.assertFalse(any_event.is_set())
+        b.set()
+        self.assertTrue(any_event.is_set())
 
 
 if __name__ == "__main__":
