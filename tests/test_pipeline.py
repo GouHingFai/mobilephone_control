@@ -22,6 +22,7 @@ from voice_tap import screen
 from voice_tap.adb import AdbError
 from voice_tap.clicker import Clicker
 from voice_tap.config import Config
+from voice_tap.ui_state import UiState
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -1393,6 +1394,82 @@ class TestAnyEvent(unittest.TestCase):
         self.assertFalse(any_event.is_set())
         b.set()
         self.assertTrue(any_event.is_set())
+
+
+class TestCollectState(unittest.TestCase):
+    """
+    界面要显示的东西都从这儿来。**纯读**，所以能单测。
+
+    开关的真相源是那些活对象，这里现读 —— 不另存一份，
+    否则会出现「界面显示开着、实际没开」的分裂。
+    """
+
+    def _ctx(self):
+        cfg = Config()
+        gate = StubVoiceGate()
+        hotkeys = StubHotkeys()
+        hotkeys.numpad_enabled = True
+        return {
+            "cfg": cfg,
+            "mode": "listen",
+            "voice_gate": gate,
+            "hotkeys": hotkeys,
+            "ui": UiState(),
+        }
+
+    def test_reports_live_toggles(self):
+        ctx = self._ctx()
+        state = app.collect_state(ctx)
+        self.assertTrue(state["toggles"]["voice"])
+        self.assertEqual(state["toggles"]["mode"], "listen")
+        self.assertTrue(state["toggles"]["numpad"])
+        self.assertTrue(state["toggles"]["prefetch"])
+        self.assertTrue(state["toggles"]["voice_next"])
+
+    def test_reflects_changes_immediately(self):
+        ctx = self._ctx()
+        ctx["cfg"].prefetch.after_click = False
+        self.assertFalse(app.collect_state(ctx)["toggles"]["prefetch"])
+
+    def test_without_ui_returns_empty(self):
+        ctx = self._ctx()
+        del ctx["ui"]
+        state = app.collect_state(ctx)
+        self.assertIsNone(state["screen"])
+        self.assertEqual(state["inputs"], [])
+
+
+class TestPublishScreen(unittest.TestCase):
+
+    def test_publishes_options_without_coordinates(self):
+        ctx = {"ui": UiState()}
+        snap = screen.read_screen(GRE_XML)
+
+        app.publish_screen(ctx, snap, "预读", age=1.2)
+
+        view = ctx["ui"].current_screen()
+        self.assertEqual(view.prompt, "degrade")
+        self.assertEqual([o.index for o in view.options], [1, 2, 3, 4, 5])
+        self.assertEqual(view.options[0].text, "adj. 清晰易懂的")
+        self.assertFalse(hasattr(view.options[0], "y"), "界面不显示坐标")
+        self.assertEqual(view.source, "预读")
+        self.assertAlmostEqual(view.age_seconds, 1.2)
+
+    def test_noop_without_ui(self):
+        app.publish_screen({"ui": None}, screen.read_screen(GRE_XML), "预读")
+
+
+class TestNoteInput(unittest.TestCase):
+
+    def test_records(self):
+        ctx = {"ui": UiState()}
+        app.note_input(ctx, "numpad", "3", outcome="点了第 3 个")
+        events = ctx["ui"].recent_inputs()
+        self.assertEqual(events[0].label, "3")
+        self.assertEqual(events[0].outcome, "点了第 3 个")
+
+    def test_noop_without_ui(self):
+        app.note_input({"ui": None}, "numpad", "3")
 
 
 if __name__ == "__main__":

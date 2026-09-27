@@ -30,6 +30,7 @@ from .asr import AsrError, Recognizer
 from .clicker import Clicker
 from .config import load_config
 from .hotkey import HotkeyManager
+from .ui_state import InputEvent, OptionView, ScreenView
 from .voice_gate import VoiceGate
 
 # 所有输出同时写一份到文件。
@@ -441,6 +442,9 @@ def grab_screen(ctx, use_prefetch=True):
         cached = prefetcher.take_or_wait()
         if cached is not None:
             snap, age = cached
+            # 界面第二块的数据来源：把「手里那一屏」交给界面显示。
+            # 注意**不带坐标** —— 界面只显示序号和文字。
+            publish_screen(ctx, snap, "预读", age)
             return snap, f"预读，{age:.1f} 秒前读好的（没读屏）"
 
     # 走到这里说明没有可用的预读结果（预读没做成 / 超时了 / 这是第一次操作）。
@@ -452,6 +456,7 @@ def grab_screen(ctx, use_prefetch=True):
     prefetcher.note(snap, read_at=read_start)
     say(f"       [注意] 没有可用的预读结果（{prefetcher.miss_reason()}），"
         f"当场读了一次（{read_ms:.0f} 毫秒）")
+    publish_screen(ctx, snap, "当场读屏")
     return snap, f"当场读屏 {read_ms:.0f} 毫秒（{len(xml) // 1024} KB）"
 
 
@@ -525,6 +530,64 @@ def handle_intent(name, ctx, wake_event=None):
             wake_event.set()
 
 
+def collect_state(ctx):
+    """
+    拼一份「界面要显示的东西」。**只读，不改任何状态** —— 所以能单测。
+
+    开关一律现读活对象（voice_gate / hotkeys / mode / 配置），不另存一份。
+    """
+    ui = ctx.get("ui")
+    return {
+        "toggles": {
+            "voice": ctx["voice_gate"].enabled,
+            "mode": ctx["mode"],
+            "numpad": ctx["hotkeys"].numpad_enabled,
+            "prefetch": ctx["cfg"].prefetch.after_click,
+            "voice_next": ctx["cfg"].voice.next_command,
+        },
+        "screen": ui.current_screen() if ui else None,
+        "inputs": ui.recent_inputs() if ui else [],
+    }
+
+
+def publish_screen(ctx, snap, source, age=None):
+    """把「程序手里那一屏」交给界面显示（**不带坐标**）"""
+    ui = ctx.get("ui")
+    if ui is None:
+        return
+    ui.set_screen(ScreenView(
+        prompt=snap.prompt,
+        options=[OptionView(i, n.text) for i, n in enumerate(snap.options, 1)],
+        source=source,
+        age_seconds=age,
+        page=snap.page,
+        ok=snap.ok,
+        reason=snap.reason,
+    ))
+
+
+def note_input(ctx, kind, label, detail="", outcome=""):
+    """记一条「我的输入」给界面看（没开界面时是空操作）"""
+    ui = ctx.get("ui")
+    if ui is None:
+        return
+    ui.record_input(InputEvent(kind=kind, label=label, detail=detail, outcome=outcome))
+
+
+def _input_kind_and_label(key, description):
+    """
+    从 do_click 的 key 推出「这是一次什么输入」，给界面第三块用。
+
+    三条路径本来就通过 key 区分了自己（小键盘传 ("numpad", 几号)、
+    下一题传 ("next",)、语音传 None），不必再往 ctx 里塞额外标记。
+    """
+    if key and key[0] == "numpad":
+        return "numpad", str(key[1])
+    if key and key[0] == "next":
+        return "next", "0"
+    return "speech", description
+
+
 def do_click(node, ctx, description, key=None):
     """
     所有点击的唯一出口：打日志 → 点 → 作废缓存 → 后台预读下一屏。
@@ -545,11 +608,21 @@ def do_click(node, ctx, description, key=None):
     else:
         say("[点击] 已跳过")
 
+    kind, label = _input_kind_and_label(key, description)
     if not (clicked and not ctx["preview"]):
         # 这一下没有真的点下去（被防连点挡了，或者 preview 模式）。
         # **界面不会翻，手里那份界面数据仍然是有效的**，作废它只会让下一次
         # 操作白白多读一次屏（约 2.4 秒）。所以这里什么都不做。
+        #
+        # 但要给界面第三块一个交代：明确写「已跳过（防连点）」，
+        # 免得界面上看起来像什么都没发生。preview 模式不算「跳过」，
+        # 它本来就只是画个圈，不记（界面第三块显示的是真实点击的结果）。
+        if not clicked:
+            note_input(ctx, kind, label, outcome="已跳过（防连点）")
         return clicked
+
+    # 界面第三块：记下这次输入的结果，界面读 collect_state 就能显示出来。
+    note_input(ctx, kind, label, outcome=f"点了 {description}")
 
     # 点下去那一瞬 App 就要翻页了，手里的界面数据立刻作废，
     # 免得下一句话拿着上一题的选项去匹配。
@@ -640,6 +713,10 @@ def run_voice_loop(ctx, hotkeys, recognizer, once=False, wake_event=None):
 def handle_speech(text, logprob, ctx):
     """一句话的完整处理：抓屏 → 匹配 → 点击"""
     say(f"[听到] {text!r}   置信度 {logprob:.2f}")
+    # 界面第三块：先把「听到了什么」记下来（结果由后面的 do_click 补，
+    # 所以这里 outcome 先写「（见下）」）。
+    note_input(ctx, "speech", text,
+               detail=f"置信度 {logprob:.2f}", outcome="（见下）")
 
     timing = ctx["recognizer"].last_timing
     if timing:
@@ -729,6 +806,8 @@ def handle_numpad(number, ctx, stamp=None):
     # 不一样就说明中间翻了页 —— 那这一下绝不能点（会点到新题目上）。
     if stamp is not None and ScreenPrefetcher.signature(snap) != stamp:
         say("[小键盘] 这一下已忽略：界面在按键之后翻页了（不点，免得点到新题上）")
+        note_input(ctx, "numpad", str(number),
+                   outcome="已忽略：界面在按键之后翻页了")
         return
 
     if not snap.ok:

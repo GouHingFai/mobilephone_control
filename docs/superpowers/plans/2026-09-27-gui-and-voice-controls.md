@@ -1255,20 +1255,34 @@ def note_input(ctx, kind, label, detail="", outcome=""):
     return snap, f"当场读屏 {read_ms:.0f} 毫秒（{len(xml) // 1024} KB）"
 ```
 
-在 `do_click()` 里记结果（**界面第三块的数据来源**）：
+在 `do_click()` 里记结果（**界面第三块的数据来源**）。先从现成的 `key` 参数推出「这是一次什么输入」，
+别另造一套标记：
 
 ```python
-    if not (clicked and not ctx["preview"]):
-        if not clicked:
-            note_input(ctx, ctx.get("_click_kind", "click"), ctx.get("_click_label", description),
-                       outcome="已跳过（防连点）")
-        return clicked
-    note_input(ctx, ctx.get("_click_kind", "click"), ctx.get("_click_label", description),
-               outcome=f"点了 {description}")
+def _input_kind_and_label(key, description):
+    """
+    从 do_click 的 key 推出「这是一次什么输入」，给界面第三块用。
+
+    三条路径本来就通过 key 区分了自己（小键盘传 ("numpad", 几号)、
+    下一题传 ("next",)、语音传 None），不必再往 ctx 里塞额外标记。
+    """
+    if key and key[0] == "numpad":
+        return "numpad", str(key[1])
+    if key and key[0] == "next":
+        return "next", "0"
+    return "speech", description
 ```
 
-（`ctx["_click_kind"]` / `ctx["_click_label"]` 由三条路径在调 `do_click` 前塞进 ctx；
-嫌麻烦可先用固定值 `("numpad", description)`，界面一样能显示。**这一步只要能看到结果即可**。）
+然后 `do_click` 里：
+
+```python
+    kind, label = _input_kind_and_label(key, description)
+    if not (clicked and not ctx["preview"]):
+        if not clicked:
+            note_input(ctx, kind, label, outcome="已跳过（防连点）")
+        return clicked
+    note_input(ctx, kind, label, outcome=f"点了 {description}")
+```
 
 在动作时戳被拦下的那个分支加：
 
