@@ -504,8 +504,17 @@ class TestIntents(unittest.TestCase):
         self.assertEqual(state.take_intents(), ["toggle_voice", "set_mode"])
         self.assertEqual(state.take_intents(), [], "取过就没了")
 
-    def test_thread_safety(self):
-        """多线程狂写、同时狂读，不能出错，读到的也得是完整的一份"""
+    def test_concurrent_access_does_not_crash(self):
+        """
+        多线程同时读写，不崩、不卡死、读到的是一份完整的界面数据。
+
+        **说清楚这条测试不是什么**（审查实测后如实标注）：它**抓不住竞态**。
+        这个模块的线程安全来自「一把锁 + 整体换引用」，而 `set_screen` 换的是
+        对象引用、在 CPython 下本就是原子的，所以把锁整个拿掉，这条测试照样全绿
+        （实测 160 次无反例）。它是一条**冒烟测试**：能挡住「读到半截」「死锁」
+        「current_screen 恒返回 None」这类明显回归，**不能**当作锁的护栏。
+        别把它的绿色当成「并发正确性已验证」。
+        """
         state = UiState(keep_inputs=50)
         stop = threading.Event()
 
@@ -527,7 +536,7 @@ class TestIntents(unittest.TestCase):
                    threading.Thread(target=reader)]
         for t in threads:
             t.start()
-        threading.Event().wait(0.3)
+        time.sleep(0.3)
         stop.set()
         for t in threads:
             t.join(timeout=2)
@@ -632,6 +641,10 @@ class UiState:
 
     def recent_inputs(self, limit=5):
         """最近的输入，**最新的在前**"""
+        if limit <= 0:
+            # 没有这一句的话，limit=0 时 items[-0:] 会返回**全部**而不是空 ——
+            # 切片对 0 的处理和直觉相反，是个安静的错行为。
+            return []
         with self._lock:
             items = list(self._inputs)
         return items[-limit:][::-1]

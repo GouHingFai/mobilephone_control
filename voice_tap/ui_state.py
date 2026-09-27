@@ -53,6 +53,24 @@ class InputEvent:
 
 
 class UiState:
+    """界面与主逻辑共享的状态黑板（线程安全）。
+
+    线程安全靠三条不变量，缺一不可 —— 这才是这一层安全性的依据：
+
+      1. **一把锁保护全部字段**。`_screen` / `_inputs` / `_intents` 共用 `self._lock`，
+         每个读写路径都在锁里，没有哪条绕过它。
+      2. **写入是整体换引用**。`set_screen` 换掉的是整个 `ScreenView` 对象，
+         界面读到的永远是完整的一份，不会出现「新 prompt 配旧 options」的半截状态。
+         `take_intents` 同理：整体取走、整体换一个新的 list，不做原地增删。
+      3. **调用方的约定**：`ScreenView` 以及它里面的 `options` 是**裸对象**，
+         构造好之后**不许再改**。谁要更新就新建一个再 `set_screen`。
+         违反了这条，第 2 条的保证就没了 —— 类型系统管不住这种共享可变，
+         只能靠这条约定。
+
+    注意：测试里那条并发用例只是**冒烟测试**，它验证不了上面这些不变量
+    （set_screen 换引用在 CPython 下本就原子，拿掉锁它也不会红）。
+    详见 tests/test_ui_state.py 里那条测试的 docstring。
+    """
 
     def __init__(self, keep_inputs=8):
         self._lock = threading.Lock()

@@ -8,6 +8,7 @@ test_ui_state.py —— 界面与主逻辑之间的共享状态
 """
 
 import threading
+import time
 import unittest
 
 from voice_tap.ui_state import InputEvent, OptionView, ScreenView, UiState
@@ -62,8 +63,23 @@ class TestIntents(unittest.TestCase):
         self.assertEqual(state.take_intents(), ["toggle_voice", "set_mode"])
         self.assertEqual(state.take_intents(), [], "取过就没了")
 
-    def test_thread_safety(self):
-        """多线程狂写、同时狂读，不能出错，读到的也得是完整的一份"""
+    def test_concurrent_access_does_not_crash(self):
+        """多线程狂写、同时狂读的**冒烟测试** —— 挡得住什么、挡不住什么，都说清楚。
+
+        能挡住（明显回归）：
+          - 读到半截：current_screen 返回残缺对象 / None，或 recent_inputs 抛异常；
+          - 死锁：拿锁的路径互相卡住，线程 join 超时；
+          - current_screen 恒返回 None 这类接线错误。
+
+        抓不住（竞态）：
+          - 本模块的线程安全来自「一把锁 + 整体换引用」。set_screen 换的是对象引用，
+            换引用在 CPython 下本就原子，所以**把 ui_state.py 里的锁整个拿掉，这条测试照样全绿**
+            （审查者实测：连跑 160 次，一次都没红）。
+          - 它没有、也无法在这一层构造出稳定的竞态。
+
+        **别把它的绿色当成「并发正确性已验证」。** 真正的依据是 ui_state.UiState
+        类文档里写的那几条不变量（一把锁 + 整体换引用 + 「ScreenView 构造后不再改」的调用方约定）。
+        """
         state = UiState(keep_inputs=50)
         stop = threading.Event()
 
@@ -85,7 +101,7 @@ class TestIntents(unittest.TestCase):
                    threading.Thread(target=reader)]
         for t in threads:
             t.start()
-        threading.Event().wait(0.3)
+        time.sleep(0.3)
         stop.set()
         for t in threads:
             t.join(timeout=2)
