@@ -582,15 +582,25 @@ def run_voice_loop(ctx, hotkeys, recognizer, once=False, wake_event=None):
     「等你说话」上，界面点了开关得能让它立刻回来看一眼（见 handle_intent）。
     """
     while not hotkeys.quit_requested.is_set():
+        # 先把上一轮留下的陈旧唤醒丢掉 —— 必须在循环**最开头**做。
+        #
+        # 这一步不能挪到 wait_until_open 之后：那段时间正是点击后的静音期
+        # （约 2.5 秒），用户若在这期间点了界面开关，handle_intent 置位的唤醒
+        # 会被紧跟着的 clear() 抹掉。被抹掉之后 stop.is_set() 报 False，
+        # 监听就带着**过期状态**老老实实阻塞进去 —— 一次唤醒被静默吞掉，
+        # 用户明明点了开关，却要等到下次开口才生效。
+        #
+        # 放在开头，只会丢掉「上一轮」的陈旧唤醒；进等待之后新到的那一次
+        # 能活到构建 stop 的那一刻，于是监听立刻返回、回到顶部重新判断。
+        if wake_event is not None:
+            wake_event.clear()
+
         if ctx["mode"] == "listen":
             if not ctx["voice_gate"].enabled:
                 # 语音关着（按了 F7）—— 不用监听，省得白忙
                 time.sleep(0.1)
                 continue
             ctx["voice_gate"].wait_until_open(hotkeys.quit_requested)
-            if wake_event is not None:
-                # 进监听前清零 —— 否则上一次留下的置位会立刻把这次等待打断，变成空转
-                wake_event.clear()
             # 两个中断源合成一个：退出请求、以及「开关变了、快回来看一眼」。
             # 音频层每 50 毫秒查一次 is_set()，所以关窗口也能立刻退出。
             stop = (_AnyEvent(hotkeys.quit_requested, wake_event)

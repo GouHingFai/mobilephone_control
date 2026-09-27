@@ -1094,19 +1094,45 @@ class StubRecognizerLoop:
 
     last_timing = {}
 
-    def __init__(self, utterances=None):
+    def __init__(self, utterances=None, record_stop=False):
         self.utterances = list(utterances or [])
         self.calls = []          # [("listen_once", kwargs) | ("listen_pressed", kwargs)]
         self.held_events = []    # listen_pressed 收到的第一个实参（「正在按住」那个事件）
+        # 记下进监听那一刻「中断源是否已被置位」——「唤醒有没有被吞掉」就看它。
+        # 默认关：stop_event 有时是 QuitAfterNCalls，调一次 is_set() 就多算一圈，
+        # 会打乱别的用例对圈数的断言。只在真的要看它时才开。
+        self.record_stop = record_stop
+        self.stop_states = []
 
     def listen_once(self, **kwargs):
         self.calls.append(("listen_once", kwargs))
+        if self.record_stop:
+            stop = kwargs.get("stop_event")
+            self.stop_states.append(None if stop is None else stop.is_set())
         return self.utterances.pop(0) if self.utterances else None
 
     def listen_pressed(self, held_event, **kwargs):
         self.calls.append(("listen_pressed", kwargs))
         self.held_events.append(held_event)
         return self.utterances.pop(0) if self.utterances else None
+
+
+class WakeDuringGate(StubVoiceGate):
+    """
+    假闸门：`wait_until_open()` 一被调用就把 `wake_event` 置位。
+
+    这模拟的是审查里那个真实场景 —— 主循环正阻塞在「点击后的静音期」里，
+    用户在界面点了开关，于是 handle_intent 置位了 wake_event。
+    进监听时那个置位必须还活着，才能立刻把监听打断、回顶部重新判断。
+    """
+
+    def __init__(self, wake_event):
+        super().__init__()
+        self.wake_event = wake_event
+
+    def wait_until_open(self, stop_event=None, poll=0.05):
+        self.wake_event.set()
+        return 0.0
 
 
 class TestRunVoiceLoop(unittest.TestCase):
@@ -1177,6 +1203,35 @@ class TestRunVoiceLoopBranches(unittest.TestCase):
         self.assertEqual(recognizer.calls, [], "语音关着还去监听，就是白等一次说话")
         self.assertEqual(fake.taps, [])
 
+    # ---------------------------------------------------------- 唤醒不被吞掉
+
+    def test_wake_arriving_during_gate_wait_is_not_swallowed(self):
+        """
+        唤醒在 `wait_until_open`（点击后的静音期）里到达 —— 不能被抹掉。
+
+        `clear()` 若放在 `wait_until_open` **之后**，这个静音期里置位的
+        wake_event 会被那一句清掉，于是合成的 stop_event 报「没被置位」，
+        监听带着过期状态老老实实阻塞进去 —— 一次唤醒被静默吞掉，
+        用户点了开关却要等到下次开口才生效。
+
+        所以 `clear()` 必须在循环**开头**、进等待之前：
+        只丢上一轮的陈旧唤醒，放过等待期间新到的那一次。
+        """
+        ctx, _fake = self._ctx()
+        wake = threading.Event()
+        # 喂一句正常台词 + once：跑完这一圈就 break，不会挂死，
+        # 也不依赖 QuitAfterNCalls（那个假事件连 stop.is_set() 也会数进去）。
+        recognizer = StubRecognizerLoop([("清晰", -0.4)], record_stop=True)
+        hotkeys = StubHotkeys()
+        ctx["voice_gate"] = WakeDuringGate(wake)   # 静音期里用户点了开关
+
+        app.run_voice_loop(ctx, hotkeys, recognizer, once=True, wake_event=wake)
+
+        self.assertEqual(
+            recognizer.stop_states, [True],
+            "静音期里到达的唤醒被吞了 —— 进监听时 stop_event 没报置位，"
+            "监听会带着过期状态阻塞进去。clear() 必须在循环开头，不能放在 wait_until_open 之后。")
+
     # ---------------------------------------------------------- hotkey 模式
 
     def test_hotkey_mode_goes_through_listen_pressed(self):
@@ -1225,7 +1280,17 @@ class TestRunVoiceLoopBranches(unittest.TestCase):
     # ---------------------------------------------------------- 兜底与收尾
 
     def test_adb_error_is_absorbed_and_loop_survives(self):
-        """读屏失败（比如手机掉了）—— 记下来，循环照常转，不崩"""
+        """
+        读屏失败（比如手机掉了）—— 记下来，循环照常转，不崩。
+
+        这条钉的是**结果**（异常不会掀翻循环），不是循环里那个
+        `except AdbError` 分支本身。审查实测：删掉任意**一层** `except AdbError`
+        它都还是绿的，只有两层都删才变红 —— `handle_speech` 里一层、
+        主循环里一层。而主循环那一层目前其实**不可达**（下游的 adb 调用
+        要么自己捕获，要么在预读线程里被吞）。
+        所以别为了「真覆盖到那个分支」去加奇怪的桩：那样只会测到测试脚手架，
+        不是行为。
+        """
         ctx, _fake = self._ctx()
 
         class BrokenAdb:

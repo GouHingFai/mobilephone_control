@@ -51,6 +51,13 @@ REQUIRED_CLASSES = {
         "TestForceRead",                   # 小键盘 . 强制重新读屏
         "TestVoiceMutedAfterClick",        # 点完不监听（手机在念单词）
         "TestLogging",
+        # 下面这几个整类删掉时，剩余用例数仍高于基线（72→65 > 59），
+        # 单靠用例数发现不了 —— 但它们钉的是界面的开关能不能真的生效、
+        # 以及主循环的循环体本身。正是 test_inventory「防悄悄失去保护」的立意所在。
+        "TestRunVoiceLoopBranches",        # 主循环循环体的各条分支
+        "TestHandleIntent",                # 界面按钮与热键走同一份代码
+        "TestToggleFlag",                  # 界面上的预读／语音下一题开关
+        "TestAnyEvent",                    # 退出请求与唤醒合成一个中断源
     ],
     "tests.test_screen": [
         "TestForegroundGuard",             # 前台应用护栏
