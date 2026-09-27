@@ -30,6 +30,16 @@ TOGGLE_LABELS = (
     ("toggle_voice_next", "语音说下一题"),
 )
 
+# 这五个开关**分两行**摆：前三个一行，后两个一行。
+#
+# 为什么不能一行排开：默认窗口宽 360 像素，而每个按钮 width=15 字符宽 ——
+# 一行五个的**请求宽度**远超窗口，后面几个会被挤掉、根本点不到。
+# （实测把这排按钮建在 360px 的窗口里：第三个「小键盘」被挤到 16 像素宽，
+#  「点击后预读」和「语音说下一题」各只剩 1 像素 —— 等于没有。）
+# 要命的是后两个（「点击后预读」「语音说下一题」）恰恰是**没有热键等价物**的
+# 两个（另外三个有 F7/F9/F10）—— 一旦被挤没，用户就没有别的办法打开它们。
+TOGGLE_ROWS = (TOGGLE_LABELS[:3], TOGGLE_LABELS[3:])
+
 
 class AppWindow:
 
@@ -79,11 +89,26 @@ class AppWindow:
 
         box = ttk.LabelFrame(self.root, text="控制")
         box.pack(fill="x", **pad)
-        for name, _label in TOGGLE_LABELS:
-            button = ttk.Button(box, text=name, width=15,
-                                command=lambda n=name: self.on_intent(n))
-            button.pack(side="left", **pad)
-            self._buttons[name] = button
+        # 每行一个 Frame；行里的按钮用 grid 摆成**等宽列**（uniform）并 sticky="ew"。
+        #
+        # 这样布局只取决于窗口宽度，跟按钮里的字多长无关：
+        #   第一行三个各占约 1/3 宽，第二行两个各占约 1/2 宽。
+        # 于是既不用一行塞五个（塞不下），也不会出现某个按钮被挤没。
+        #
+        # width 从 15 调到 8 —— 它在这里只是列宽的一个下限（约 80 像素），
+        # 真正的宽度由上面的等分决定，所以调小它不影响显示，只让「最窄列」更宽松。
+        # 实测（360×520 与最小 340×380 两种窗口）：每个按钮都 ≥96 像素，
+        # 最长的标签「语音说下一题：开」约 112 像素，尚有 ~1.34 倍余量。
+        for row_of in TOGGLE_ROWS:
+            row = ttk.Frame(box)
+            row.pack(fill="x")
+            for col in range(len(row_of)):
+                row.columnconfigure(col, weight=1, uniform="toggle")
+            for col, (name, _label) in enumerate(row_of):
+                button = ttk.Button(row, text=name, width=8,
+                                    command=lambda n=name: self.on_intent(n))
+                button.grid(row=0, column=col, sticky="ew", padx=6, pady=3)
+                self._buttons[name] = button
 
         row = ttk.Frame(self.root)
         row.pack(fill="x", **pad)

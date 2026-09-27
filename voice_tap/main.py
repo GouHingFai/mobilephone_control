@@ -854,9 +854,32 @@ def handle_next(ctx, source="小键盘 0"):
 
     if cfg.fixed_next_position is not None:
         x, y = cfg.fixed_next_position
+        # 设计文档 §6.1：**每次点击前都要校验前台应用** —— 这个工具是「盲点」的，
+        # 用户看不见程序看到了什么，点错地方后果不可预期。读屏那条路（下面那段）
+        # 已经比对了 snap.foreground_package，这条路不读屏，就用手里「最近见过的一屏」
+        # 核一下（peek()，**零读屏成本**）。
+        #
+        # 为什么这里只做「前台应用对不对」这半道校验，不做 §6.1 的第二条
+        # （无障碍树里至少 2 个 tv_question 节点）：「下一题」按钮长在**详情页**上
+        # （答完题的释义页），那里本来就没有 tv_question 选项节点 —— 硬套第二条
+        # 会把这条路唯一的正常用法也一并挡死。前台包名这一层已经拦住了「停在
+        # 别的 App 上误点」这个真正危险的情况。
+        #
+        # 局限：peek 是「最近见过的」，不保证是此刻的。刚切走 App、还没来得及
+        # 读到新屏时，这道护栏可能看不出来（代价是它不读屏、快）。
+        peeked = ctx["prefetcher"].peek()
+        if peeked is not None and peeked.foreground_package != screen.GRE_PACKAGE:
+            detected = peeked.foreground_package or "未知应用"
+            say(f"       [固定位置] 当前检测到的是 {detected}，不在 GRE3000，"
+                f"这一下不点（本应点 {x}, {y}）")
+            note_input(ctx, "next", "0",
+                       outcome=f"已拒绝：当前不在 GRE3000（{detected}）")
+            return
+
         node = screen.Node(text="下一题（固定位置）", x=x, y=y, clickable=True)
         say(f"       [固定位置] 用配置坐标 ({x}, {y})，耗时 "
-            f"{(time.monotonic() - started) * 1000:.0f} 毫秒（未做界面校验）")
+            f"{(time.monotonic() - started) * 1000:.0f} 毫秒"
+            f"（未读屏，只核对了最近见过的一屏前台应用）")
         do_click(node, ctx, "「下一题」（固定位置）", key=("next",))
         return
 

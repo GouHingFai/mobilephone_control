@@ -36,7 +36,9 @@ BASELINE_COUNTS = {
     "tests.test_matcher": 53,
     # 59 → 103：界面与语音「下一题」那一期加进来的用例（UiState 接线、
     # 动作时戳、意图/唤醒、窗口几何……）。基线贴着实际值。
-    "tests.test_pipeline": 103,
+    # 103 → 106：「下一题」固定坐标路径的前台护栏（peek 返回别的 App / None /
+    # GRE3000 三种情形）三条用例。
+    "tests.test_pipeline": 106,
     "tests.test_prefetch": 26,
     "tests.test_screen": 27,
     # 7：UiState（线程安全状态黑板）—— 界面与主逻辑唯一的交汇点

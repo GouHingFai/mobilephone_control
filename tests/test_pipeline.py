@@ -105,6 +105,7 @@ class StubPrefetcher:
         self.on_speech_triggers = 0
         self.noted = 0
         self.cached = None      # 测试可以塞一份进去，模拟「已经预读好了」
+        self.peeked = None      # 测试可以塞一份进去，模拟「最近见过的那一屏」
         self._miss = "还没有预读结果"
 
     def take(self):
@@ -129,8 +130,13 @@ class StubPrefetcher:
         self.noted += 1
 
     def peek(self):
-        """看一眼最近见过的界面（不消费）—— 主循环要拿它当识别的提示词"""
-        return None
+        """
+        看一眼最近见过的界面（不消费）。
+
+        两个用处：主循环拿它当识别的提示词；「下一题」的固定坐标路径拿它
+        核对前台应用（设计 §6.1 的护栏）。默认 None = 还没有任何界面数据。
+        """
+        return self.peeked
 
     def trigger_after_click(self):
         self.after_click_triggers += 1
@@ -451,6 +457,47 @@ class TestNextButton(unittest.TestCase):
         app.handle_next(ctx)
 
         self.assertEqual(fake.dump_calls, 0, "配了固定坐标就不该读屏")
+        self.assertEqual(fake.taps, [(909, 2476)])
+
+    def test_fixed_position_blocked_when_peeked_screen_is_other_app(self):
+        """
+        固定坐标这条路也要有前台护栏（设计文档 §6.1）。
+
+        没有护栏时，手机停在**别的 App**（比如微信/QQ）上，说一句「继续」
+        或者「next」也会朝固定坐标 (909, 2476) 点下去 —— 那是盲点行为，
+        后果不可预期。用 ctx["prefetcher"].peek()（零读屏成本）拦一道：
+        最近见过的那一屏前台不是 GRE3000，就拒绝点击。
+        """
+        ctx, fake = make_ctx(DETAIL_XML)
+        ctx["cfg"].hotkey.fixed_next_position = (909, 2476)
+        ctx["prefetcher"].peeked = screen.read_screen(QQ_XML)   # 前台是 QQ
+
+        app.handle_next(ctx)
+
+        self.assertEqual(fake.taps, [], "前台不在 GRE3000 时固定坐标也不能点")
+
+    def test_fixed_position_clicks_when_peeked_screen_is_gre(self):
+        """最近见过的那一屏确实是 GRE3000 → 护栏放行，照常点"""
+        ctx, fake = make_ctx(DETAIL_XML)
+        ctx["cfg"].hotkey.fixed_next_position = (909, 2476)
+        ctx["prefetcher"].peeked = screen.read_screen(DETAIL_XML)
+
+        app.handle_next(ctx)
+
+        self.assertEqual(fake.taps, [(909, 2476)])
+
+    def test_fixed_position_clicks_when_peek_is_none(self):
+        """
+        peek() 还没有任何界面数据（比如刚启动、还没读到过屏）→ 照常点。
+
+        「没有依据就不拦」—— 别为了加护栏反而把正常路径挡死。
+        """
+        ctx, fake = make_ctx(DETAIL_XML)
+        ctx["cfg"].hotkey.fixed_next_position = (909, 2476)
+        self.assertIsNone(ctx["prefetcher"].peek(), "桩默认没有界面数据")
+
+        app.handle_next(ctx)
+
         self.assertEqual(fake.taps, [(909, 2476)])
 
     def test_no_button_does_not_click(self):
