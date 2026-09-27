@@ -1311,14 +1311,33 @@ python -m unittest discover -s tests
 
 **Files**
 - Create: `voice_tap/gui.py`、`run_gui.bat`
-- Modify: `voice_tap/main.py`
+- Modify: `voice_tap/main.py`、`voice_tap/config.py`、`config.yaml`
 - Test: 语法校验 + 全套测试（界面本身没法在沙箱里自动测，见下）
 
 **Interfaces**
 - Produces:
-  - `gui.AppWindow(root, collect_state, on_intent, refresh_ms=150, topmost=True)`
-  - `gui.run(collect_state, on_intent, refresh_ms=150, topmost=True, geometry=None, on_closed=None)`
+  - `gui.AppWindow(root, collect_state, on_intent, refresh_ms=150, topmost=True, on_closed=None, should_close=None)`
+  - `gui.run(collect_state, on_intent, refresh_ms=150, topmost=True, geometry=None, on_closed=None, should_close=None)`
   - `main._load_window_geometry(path, fallback)` / `main._save_window_geometry(path, geometry)`
+
+> **⚠ 步骤 0 是必需的（原计划漏写，2026-09-27 补记）**
+> 本任务**必须**同时给 `voice_tap/config.py` 加 `GuiConfig`、给 `config.yaml` 加 `gui:` 段。
+> 少了它，`main()` 里那句 `use_gui = args.gui or cfg.gui.enabled` 会在
+> **不带 `--gui` 的正常路径**上直接抛 `AttributeError: 'Config' object has no
+> attribute 'gui'` —— 程序连起都起不来，不只是界面的事。
+> 所以这不是「顺手加的」，是本任务的前置条件；原计划把它漏在任务分工之外了。
+
+- [ ] **步骤 0：`config.py` 加 `GuiConfig`、`config.yaml` 加 `gui:` 段（必需）**
+
+在 `voice_tap/config.py` 里新增一个 `GuiConfig` 数据类（字段：`enabled=False`、
+`window=(x, y, w, h)`、`topmost=True`、`refresh_ms=150`），挂进 `Config`，
+并在 `load_config()` 里解析 `config.yaml` 的 `gui:` 段。`config.yaml` 相应加 `gui:` 段
+（`enabled` 默认 `false`，`window` 给一组默认坐标）。
+
+**为什么非做不可**：`main()` 里读 `cfg.gui.enabled` 来决定开不开界面，这个读取发生在
+**所有启动路径**上（包括完全不带 `--gui` 的那种）。`Config` 上要是没有 `gui` 这个字段，
+正常启动就会在这里 `AttributeError` 崩掉 —— 与界面无关的用户也会受影响。
+配套测试加在 `tests/test_config.py`（`gui.*` 的解析与默认值）。
 
 - [ ] **步骤 1：写 `voice_tap/gui.py`**
 
@@ -1353,11 +1372,14 @@ TOGGLE_LABELS = (
 
 class AppWindow:
 
-    def __init__(self, root, collect_state, on_intent, refresh_ms=150, topmost=True):
+    def __init__(self, root, collect_state, on_intent, refresh_ms=150, topmost=True,
+                 on_closed=None, should_close=None):
         self.root = root
         self.collect_state = collect_state
         self.on_intent = on_intent
         self.refresh_ms = refresh_ms
+        self.on_closed = on_closed
+        self.should_close = should_close
         self._labels = dict(TOGGLE_LABELS)
         self._buttons = {}
 
@@ -1402,6 +1424,12 @@ class AppWindow:
     # -------------------------------------------------- 刷新
 
     def _tick(self):
+        # ESC 和界面上的「退出」都只是把 quit_requested 置了个位；
+        # 主线程正卡在 mainloop() 里，没人叫停它窗口就干留着、进程也吊着。
+        # 所以每次刷新前问一句「要不要关」，要关就走和窗口 X 相同的那条收尾路。
+        if self.should_close is not None and self.should_close():
+            self.close()
+            return
         try:
             self.refresh()
         finally:
@@ -1464,31 +1492,30 @@ class AppWindow:
 
 
 def run(collect_state, on_intent, refresh_ms=150, topmost=True,
-        geometry=None, on_closed=None):
+        geometry=None, on_closed=None, should_close=None):
     """
     开窗并进入 Tk 事件循环。**必须在主线程调用。**
 
     on_closed 会在窗口关闭时收到当前几何位置（(x, y, 宽, 高)）。
+
+    should_close 是个无参可调用对象：界面每次刷新时问它一次，一旦返回真值
+    就把窗口关掉。按 ESC、点界面上的「退出」都只是把退出请求置位，
+    **不靠这个轮询的话没人去 destroy 根窗口**，mainloop 就永远不返回、
+    进程也结束不了。三条退出路（ESC／退出按钮／窗口 X）最终都汇到 close()。
     """
     root = tk.Tk()
     if geometry:
         root.geometry(f"{geometry[2]}x{geometry[3]}+{geometry[0]}+{geometry[1]}")
     window = AppWindow(root, collect_state, on_intent,
-                       refresh_ms=refresh_ms, topmost=topmost)
+                       refresh_ms=refresh_ms, topmost=topmost,
+                       on_closed=on_closed, should_close=should_close)
 
-    def _on_close():
-        if on_closed is not None:
-            try:
-                on_closed(window.current_geometry())
-            except Exception:  # noqa: BLE001
-                pass
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", _on_close)
+    root.protocol("WM_DELETE_WINDOW", window.close)
     root.mainloop()
 ```
 
-并在 `AppWindow` 里补一个取几何位置的方法：
+并在 `AppWindow` 里补一个取几何位置的方法，**以及关窗收尾方法 `close()`**
+（窗口 X 与 ESC 都走它，两条路都要把窗口位置存下来）：
 
 ```python
     def current_geometry(self):
@@ -1496,6 +1523,21 @@ def run(collect_state, on_intent, refresh_ms=150, topmost=True,
         self.root.update_idletasks()
         return (self.root.winfo_x(), self.root.winfo_y(),
                 self.root.winfo_width(), self.root.winfo_height())
+
+    def close(self):
+        """
+        关窗前的收尾：先把窗口位置交出去存好，再销毁窗口。
+
+        **窗口 X 和 ESC/界面上的「退出」都走这一条路** —— 两条路都得存位置，
+        否则按 ESC 退出时那次的位置就白丢了。
+        """
+        if self.on_closed is not None:
+            try:
+                self.on_closed(self.current_geometry())
+            except Exception:  # noqa: BLE001
+                # 存位置失败不该拦着退出 —— 大不了下次用回默认位置
+                pass
+        self.root.destroy()
 ```
 
 - [ ] **步骤 2：先在沙箱里做语法校验**（没有显示器，跑不了真窗口）
@@ -1576,6 +1618,9 @@ def _save_window_geometry(path, geometry):
                     _save_window_geometry(window_file, geom),
                     hotkeys.quit_requested.set(),
                 ),
+                # 按 ESC / 点界面上的「退出」都只是置位 quit_requested；
+                # 真正把窗口关掉、让 mainloop 返回，靠界面轮询这个回调。
+                should_close=lambda: hotkeys.quit_requested.is_set(),
             )
         finally:
             hotkeys.quit_requested.set()
@@ -1594,6 +1639,42 @@ def _save_window_geometry(path, geometry):
 ```
 
 **注意**：`debug_dir` 这个变量在 `main()` 里已经有了（`ctx` 构造处上面），直接复用。
+
+- [ ] **步骤 3b：让「退出请求」真能关掉窗口（任务 5 与任务 7 之间的接缝）**
+
+这一段是**原计划两头都没写**的地方，必须补上，否则三条退出路里前两条是坏的：
+
+    ESC（热键回调）────┐
+    界面上的「退出」按钮 ─┤→ 只把 hotkeys.quit_requested 置位
+    窗口 X ───────────┘   └→ 走 run() 的 close() → root.destroy()
+
+「界面上的退出」按钮是这样一路走到的：点按钮 → `numpad_queue.put(("intent","quit",None))`
+→ `numpad_worker` → `dispatch_action` 的 `quit` 分支 → `ctx["intents"]["quit"]()`
+→ `hotkeys.quit_requested.set()`（见任务 5 的步骤 4／5）。
+所以 ESC 和「退出」按钮**最终都只是置了个位**，而主线程这时正卡在 Tk 的
+`mainloop()` 里 —— **没有任何东西去 `destroy()` 根窗口**，于是语音循环停了，
+窗口却留着、进程也吊着。这违背设计文档 §1.4「关窗口能立刻退出」的承诺。
+
+接缝的做法（就是上面步骤 1 里 `gui.run` 的参数 `should_close`）：
+
+- `gui.run(..., should_close=...)` / `AppWindow.__init__(..., should_close=None)`；
+- `AppWindow._tick()` 每轮先问一次 `should_close()`，返回真值就调用 `close()`
+  （先 `on_closed(当前几何)` 存位置，再 `root.destroy()`）并**不再排下一次刷新**；
+- `main()` 里传 `should_close=lambda: hotkeys.quit_requested.is_set()`。
+
+于是三条退出路（ESC / 按钮 / 窗口 X）**全都收敛到同一个收尾**：窗口关掉、
+`mainloop()` 返回、`main()` 的 `finally` 收尾（`hotkeys.stop()` / `recognizer.close()` 等）。
+注意关窗前一定要走 `on_closed(...)`，否则按 ESC 退出时窗口位置就丢了。
+
+- [ ] **步骤 3c：给窗口几何那两个工具函数补测试**
+
+`_load_window_geometry` / `_save_window_geometry` 是模块级函数、能单测，但原计划一个测试都没写。
+在 `tests/test_pipeline.py` 加一个 `TestWindowGeometry`，钉住：
+
+- 存了再读，拿回来是同一组四个整数；
+- 文件不存在 → 返回 fallback；
+- 内容坏掉（比如写了 `"乱写的"`，或四个词但都不是整数）→ 返回 fallback 且**不抛异常**；
+- 存的时候父目录不存在也能建出来。
 
 - [ ] **步骤 4：写 `run_gui.bat`**
 
@@ -1618,23 +1699,35 @@ python -m unittest discover -s tests
 python -c "compile(open('voice_tap/main.py', encoding='utf-8').read(), 'main.py', 'exec'); print('OK')"
 ```
 
-期望：用例数与开跑前**完全相同**（这一步只加界面，不改任何测试）。
+期望：比开跑前多 5 个（`tests/test_pipeline.py` 新增的 `TestWindowGeometry`）。
+`gui.py`／`main.py` 只改接线，不新增用例。
 
 - [ ] **步骤 6（用户侧手工冒烟，必须做）**
 
-沙箱里没有显示器，界面只能由用户来验。请用户执行：
+沙箱里没有显示器，界面只能由用户来验。请用户执行（二选一，都会**真正开窗**）：
 
 ```
-python -m voice_tap.main --gui --dump
+run_gui.bat
 ```
 
-（`--dump` 只抓一次屏就退出，界面会开一下就关；只要能开出来、能看到三块区域即可。）
-然后正常跑 `run_gui.bat`，确认：
+或
+
+```
+python -m voice_tap.main --gui
+```
+
+> **别用 `--gui --dump`**：`--dump` 在 `main()` 里**先于界面装配就 `return` 了**
+> （那一段在 `if args.dump:` 处直接返回，界面要用的模块全在它之后才装配），
+> 窗口根本不会开 —— 原计划把它当冒烟命令是错的（2026-09-27 更正）。
+
+确认：
 
 1. 窗口浮在 scrcpy 上面，能拖动；
 2. 每个开关点一下，窗口里的字立刻变，控制台也打印对应的一行；
 3. 按小键盘 1~9 时，「我的输入」里出现对应的记录；
-4. 关掉窗口后程序确实退出了（不再是「按了还得等」）。
+4. **按 ESC 能关掉窗口、进程也结束**（不再是「按了还得等」）；
+5. **点界面上的「退出」按钮同样能关掉窗口、进程结束**；
+6. 关掉窗口后重新起一次，窗口停在**上次关窗时的位置**（说明关闭路径存下了几何）。
 
 ---
 

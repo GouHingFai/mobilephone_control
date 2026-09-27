@@ -1677,5 +1677,63 @@ class TestUiWiringWithoutUi(unittest.TestCase):
         self.assertEqual(len(fake.taps), 1)
 
 
+class TestWindowGeometry(unittest.TestCase):
+    """
+    「关窗存位置、下次接着用」那两个工具函数。
+
+    它们是模块级函数、能单测，而这条承诺（设计文档 §1.4）此前一个测试都没有。
+
+    要点是**坏文件必须退回 fallback，不能抛异常** —— 存档坏了（手改坏了、
+    版本对不上、权限问题）不该把程序拦在门外，大不了用回默认位置。
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.path = self.dir / "gui_window.txt"
+
+    def test_save_then_load_round_trips(self):
+        """存了再读，拿回来是同一组四个整数"""
+        geometry = (120, 240, 640, 480)
+
+        app._save_window_geometry(self.path, geometry)
+
+        self.assertEqual(app._load_window_geometry(self.path, (0, 0, 1, 1)),
+                         geometry)
+
+    def test_missing_file_returns_fallback(self):
+        """文件还不存在（第一次启动）→ 返回 fallback"""
+        fallback = (10, 20, 30, 40)
+
+        self.assertEqual(
+            app._load_window_geometry(self.dir / "没有这个文件.txt", fallback),
+            fallback)
+
+    def test_corrupt_content_returns_fallback_without_raising(self):
+        """内容坏掉 → 返回 fallback，**不抛异常**"""
+        fallback = (1, 2, 3, 4)
+        self.path.write_text("乱写的", encoding="utf-8")
+
+        self.assertEqual(app._load_window_geometry(self.path, fallback), fallback)
+
+    def test_non_numeric_content_returns_fallback(self):
+        """四个词、但都不是整数 —— int() 会炸，同样要吞掉退回 fallback"""
+        fallback = (5, 6, 7, 8)
+        self.path.write_text("一 二 三 四", encoding="utf-8")
+
+        self.assertEqual(app._load_window_geometry(self.path, fallback), fallback)
+
+    def test_save_creates_missing_parent_directory(self):
+        """存的时候父目录不存在也能建出来（debug/ 可能被删过）"""
+        nested = self.dir / "a" / "b" / "gui_window.txt"
+
+        app._save_window_geometry(nested, (7, 8, 9, 10))
+
+        self.assertTrue(nested.is_file(), "父目录该被建出来，文件该落地")
+        self.assertEqual(app._load_window_geometry(nested, None), (7, 8, 9, 10))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1269,6 +1269,9 @@ def main(argv=None):
                     _save_window_geometry(window_file, geom),
                     hotkeys.quit_requested.set(),
                 ),
+                # 按 ESC / 点界面上的「退出」都只是置位 quit_requested；
+                # 真正把窗口关掉、让 mainloop 返回，靠界面轮询这个回调。
+                should_close=lambda: hotkeys.quit_requested.is_set(),
             )
         finally:
             # 关窗口 = 退出请求（on_closed 里已经置过一次）。这里再置一次是兜底：

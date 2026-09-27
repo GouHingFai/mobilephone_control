@@ -33,11 +33,14 @@ TOGGLE_LABELS = (
 
 class AppWindow:
 
-    def __init__(self, root, collect_state, on_intent, refresh_ms=150, topmost=True):
+    def __init__(self, root, collect_state, on_intent, refresh_ms=150, topmost=True,
+                 on_closed=None, should_close=None):
         self.root = root
         self.collect_state = collect_state
         self.on_intent = on_intent
         self.refresh_ms = refresh_ms
+        self.on_closed = on_closed
+        self.should_close = should_close
         self._labels = dict(TOGGLE_LABELS)
         self._buttons = {}
 
@@ -53,6 +56,21 @@ class AppWindow:
         self.root.update_idletasks()
         return (self.root.winfo_x(), self.root.winfo_y(),
                 self.root.winfo_width(), self.root.winfo_height())
+
+    def close(self):
+        """
+        关窗前的收尾：先把窗口位置交出去存好，再销毁窗口。
+
+        **窗口 X 和 ESC/界面上的「退出」都走这一条路** —— 两条路都得存位置，
+        否则按 ESC 退出时那次的位置就白丢了。
+        """
+        if self.on_closed is not None:
+            try:
+                self.on_closed(self.current_geometry())
+            except Exception:  # noqa: BLE001
+                # 存位置失败不该拦着退出 —— 大不了下次用回默认位置
+                pass
+        self.root.destroy()
 
     # -------------------------------------------------- 摆控件
 
@@ -88,6 +106,12 @@ class AppWindow:
     # -------------------------------------------------- 刷新
 
     def _tick(self):
+        # ESC 和界面上的「退出」都只是把 quit_requested 置了个位；
+        # 主线程正卡在 mainloop() 里，没人叫停它窗口就干留着、进程也吊着。
+        # 所以每次刷新前问一句「要不要关」，要关就走和窗口 X 相同的那条收尾路。
+        if self.should_close is not None and self.should_close():
+            self.close()
+            return
         try:
             self.refresh()
         finally:
@@ -150,26 +174,23 @@ class AppWindow:
 
 
 def run(collect_state, on_intent, refresh_ms=150, topmost=True,
-        geometry=None, on_closed=None):
+        geometry=None, on_closed=None, should_close=None):
     """
     开窗并进入 Tk 事件循环。**必须在主线程调用。**
 
     on_closed 会在窗口关闭时收到当前几何位置（(x, y, 宽, 高)）。
+
+    should_close 是个无参可调用对象：界面每次刷新时问它一次，一旦返回真值
+    就把窗口关掉。按 ESC、点界面上的「退出」都只是把退出请求置位，
+    **不靠这个轮询的话没人去 destroy 根窗口**，mainloop 就永远不返回、
+    进程也结束不了。三条退出路（ESC／退出按钮／窗口 X）最终都汇到 close()。
     """
     root = tk.Tk()
     if geometry:
         root.geometry(f"{geometry[2]}x{geometry[3]}+{geometry[0]}+{geometry[1]}")
     window = AppWindow(root, collect_state, on_intent,
-                       refresh_ms=refresh_ms, topmost=topmost)
+                       refresh_ms=refresh_ms, topmost=topmost,
+                       on_closed=on_closed, should_close=should_close)
 
-    def _on_close():
-        if on_closed is not None:
-            try:
-                on_closed(window.current_geometry())
-            except Exception:  # noqa: BLE001
-                # 存窗口位置失败不该拦着退出 —— 大不了下次用回默认位置
-                pass
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", _on_close)
+    root.protocol("WM_DELETE_WINDOW", window.close)
     root.mainloop()
