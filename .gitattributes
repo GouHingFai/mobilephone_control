@@ -1,0 +1,6 @@
+# .bat 必须保持 CRLF：LF 行尾会让 cmd.exe 直接中止脚本、窗口一闪而过。
+# 这条是踩过坑之后钉下的，别删。
+*.bat text eol=crlf
+*.md  text eol=lf
+*.py  text eol=lf
+*.yaml text eol=lf
