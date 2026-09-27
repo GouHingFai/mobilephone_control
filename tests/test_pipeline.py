@@ -26,6 +26,8 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 GRE_XML = (FIXTURES / "gre_degrade.xml").read_text(encoding="utf-8")
 
+SECOND_XML = (FIXTURES / "gre_prototype.xml").read_text(encoding="utf-8")
+
 QQ_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
 <hierarchy rotation="0">
   <node index="0" text="" class="android.widget.FrameLayout" package="com.tencent.mobileqq"
@@ -758,6 +760,73 @@ class TestStartupProbe(unittest.TestCase):
 
         self.assertIsNone(snap)
         self.assertIsNone(prefetcher.take(), "读不到就别往缓存里塞东西")
+
+
+class TestActionStamp(unittest.TestCase):
+    """
+    按键动作要带「按键那一刻的屏幕」的戳；执行前核对，屏幕变了就不点。
+
+    由来（真机上实测到的 bug）：在第一题上连按两下 `1`，
+    第一下点完立刻作废缓存并启动后台预读；第二下还在队列里排队，
+    等它被处理时预读已经读回了**第二题**，于是照着第二题点了第 1 个。
+    根子是：**第一题时做的动作，被用到了第二题上。**
+    """
+
+    def _setup(self, xml=GRE_XML):
+        cfg = Config()
+        cfg.prefetch.after_click = False     # 别让后台预读来搅乱
+        cfg.click.settle_ms = 0
+        fake = FakeAdb(xml)
+        pref = app.ScreenPrefetcher(fake, cfg, log=lambda *_: None)
+        pref.note(screen.read_screen(xml))
+        ctx = {
+            "adb": fake,
+            "cfg": cfg,
+            "preview": False,
+            "recognizer": StubRecognizer(),
+            "prefetcher": pref,
+            "voice_gate": StubVoiceGate(),
+            "clicker": Clicker(fake, cfg.click, log=lambda *_: None),
+        }
+        return ctx, fake, pref
+
+    def test_identity_is_none_before_any_read(self):
+        fake = FakeAdb(GRE_XML)
+        pref = app.ScreenPrefetcher(fake, Config(), log=lambda *_: None)
+        self.assertIsNone(pref.identity(), "还没读到过任何界面时不该有指纹")
+
+    def test_identity_reflects_last_seen_screen(self):
+        _ctx, _fake, pref = self._setup()
+        expected = app.ScreenPrefetcher.signature(screen.read_screen(GRE_XML))
+        self.assertEqual(pref.identity(), expected)
+
+    def test_dropped_when_screen_changed_since_press(self):
+        """按键时是第一题，轮到执行时已经翻到第二题 —— 必须不点"""
+        ctx, fake, pref = self._setup()
+        stamp = pref.identity()                     # 按键那一刻：第一题
+        pref.note(screen.read_screen(SECOND_XML))   # 界面翻了页
+        fake.xml = SECOND_XML
+
+        app.handle_numpad(1, ctx, stamp=stamp)
+
+        self.assertEqual(fake.taps, [], "界面已经变了，这一下不能点")
+
+    def test_runs_when_screen_unchanged(self):
+        """界面没翻（比如那一下没生效）—— 照常点，这正是「按错键马上改」要的"""
+        ctx, fake, pref = self._setup()
+        stamp = pref.identity()
+
+        app.handle_numpad(1, ctx, stamp=stamp)
+
+        self.assertEqual(len(fake.taps), 1)
+
+    def test_runs_when_no_stamp_given(self):
+        """没盖戳（比如语音路径）时不做拦截"""
+        ctx, fake, _pref = self._setup()
+
+        app.handle_numpad(1, ctx)
+
+        self.assertEqual(len(fake.taps), 1)
 
 
 if __name__ == "__main__":

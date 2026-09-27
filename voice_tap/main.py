@@ -210,6 +210,19 @@ class ScreenPrefetcher:
         with self._lock:
             return self._miss
 
+    def identity(self):
+        """
+        最近见过那一屏的指纹；还没读到过任何界面时返回 None。
+
+        用途是给按键动作盖章：按下的那一刻记下「当时屏幕长什么样」，
+        真正执行前再比一次 —— 不一样，就说明中间翻了页，这一下不能点。
+        （参见 handle_numpad 的 stamp 参数与 tests 里的 TestActionStamp。）
+        """
+        with self._lock:
+            if self._last_seen is None:
+                return None
+            return self.signature(self._last_seen)
+
     def take_or_wait(self, timeout=8.0):
         """
         取缓存；如果正好有一次预读在跑，**先等它跑完再取**。
@@ -493,7 +506,7 @@ def handle_speech(text, logprob, ctx):
     do_click(result.node, ctx, description)
 
 
-def handle_numpad(number, ctx):
+def handle_numpad(number, ctx, stamp=None):
     """
     小键盘按下数字：点第 number 个选项。
 
@@ -507,6 +520,14 @@ def handle_numpad(number, ctx):
     提速的正解不是「跳过读屏」，而是**把读屏提前做**：点完立刻在后台把下一屏
     读好（见 ScreenPrefetcher），按键时直接用那份结果 —— 坐标依然是系统报的
     当前值，一点没「猜」。只有没预读成时才当场读一次兜底（日志会明说）。
+
+    `stamp`（动作时戳，可为 None）是**按下按键那一刻**的屏幕指纹，由调用方
+    （热键回调）从 ScreenPrefetcher.identity() 取来。这个参数是为了修一个
+    真机上实测到的 bug：在第一题上连按两下 `1`，第一下点完立刻作废缓存并启动
+    后台预读；第二下还在队列里排队，等它被处理时预读已经读回了**第二题**，
+    于是照着第二题点了第 1 个 —— 根子是「第一题时做的动作被用到了第二题上」。
+    真正执行前拿 stamp 跟当前屏幕比一次，不一样就不点。语音路径不盖戳
+    （stamp 为 None），此时不做拦截。
     """
     say(f"[小键盘] {number}")
     started = time.monotonic()
@@ -515,6 +536,12 @@ def handle_numpad(number, ctx):
         snap, source = grab_screen(ctx)
     except AdbError as exc:
         say(f"[屏幕] {exc}")
+        return
+
+    # 核对「动作时戳」：这一下是在哪一屏按的？现在要点的又是哪一屏？
+    # 不一样就说明中间翻了页 —— 那这一下绝不能点（会点到新题目上）。
+    if stamp is not None and ScreenPrefetcher.signature(snap) != stamp:
+        say("[小键盘] 这一下已忽略：界面在按键之后翻页了（不点，免得点到新题上）")
         return
 
     if not snap.ok:
@@ -794,16 +821,20 @@ def main(argv=None):
     def numpad_worker():
         while not worker_stop.is_set():
             try:
-                number = numpad_queue.get(timeout=0.2)
+                action = numpad_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
             try:
-                if number == ".":
-                    handle_force_read(ctx)    # 小键盘 . = 强制重新读屏
-                elif number == 0:
-                    handle_next(ctx)          # 小键盘 0 = 下一题
+                kind, value, stamp = action
+            except (TypeError, ValueError):
+                continue
+            try:
+                if kind == "force_read":
+                    handle_force_read(ctx)
+                elif kind == "next":
+                    handle_next(ctx)
                 else:
-                    handle_numpad(number, ctx)
+                    handle_numpad(value, ctx, stamp=stamp)
             except AdbError as exc:
                 say(f"[!!] {exc}")
             except Exception:  # noqa: BLE001
@@ -826,9 +857,9 @@ def main(argv=None):
 
     if not hotkeys.start(
         on_toggle=toggle_mode,
-        on_option=numpad_queue.put,
-        on_next=lambda: numpad_queue.put(0),
-        on_force_read=lambda: numpad_queue.put("."),
+        on_option=lambda n: numpad_queue.put(("numpad", n, ctx["prefetcher"].identity())),
+        on_next=lambda: numpad_queue.put(("next", None, ctx["prefetcher"].identity())),
+        on_force_read=lambda: numpad_queue.put(("force_read", None, None)),
         on_toggle_voice=voice_toggle,
     ) and mode == "hotkey":
         say("      [注意] 热键不可用，先用常驻监听模式跑")
