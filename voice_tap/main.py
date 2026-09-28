@@ -108,8 +108,10 @@ class ScreenPrefetcher:
 
         按数字键 → 用上一次预读好的坐标点 → 点完立刻读下一屏 → 下次直接可用
 
-    **按数字键时不会重新读屏**。用户通过 scrcpy 看着屏幕操作，界面状态他自己清楚，
-    不需要程序每次再确认一遍。只有预读没做成时才兜底当场读一次（日志会明说）。
+    **按数字键时不重新读屏**。用户通过 scrcpy 看着屏幕操作，界面状态他自己清楚，
+    不需要程序每次再确认一遍。取界面走这三档（见 grab_screen 的 allow_stale）：
+    缓存里有就用缓存；缓存空就用「最近读到的那一屏」（**不等这一份预读读完**）；
+    连一次都没读到过才当场读一次兜底（日志会明说）。
 
     如果你自己用鼠标动了界面，按小键盘的「.」强制重新读一次。
     """
@@ -123,6 +125,13 @@ class ScreenPrefetcher:
         self._at = 0.0              # 它是什么时候读到的
         self._signature = None      # 最近一次见过的界面指纹（用来判断翻页）
         self._last_seen = None      # 最近见过的界面（不消费，给识别当上下文用）
+        # 「最近见过那一屏」是什么时候读到的。
+        #
+        # 它跟 `_at` 平时是同一个值，但**作废之后就不是了**：invalidate() 把 `_at`
+        # 清零（缓存那一份作废了），而 `_last_seen` 故意留着不动（翻页判断和识别
+        # 上下文都靠它）。所以年龄必须单独记一个 —— 拿清零后的 `_at` 去算，会得出
+        # 一个「开机以来」那么大的数（monotonic 从开机算起），日志就成了假话。
+        self._last_seen_at = 0.0
         self._busy = False
         self._miss = "还没有预读结果"  # 上次 take 落空的原因
         # 「代数」：每作废一次缓存就 +1。
@@ -179,6 +188,7 @@ class ScreenPrefetcher:
         self._at = read_at
         self._signature = self.signature(snap)
         self._last_seen = snap
+        self._last_seen_at = read_at
         return True
 
     def note_if_current(self, snap, generation, read_at=None):
@@ -276,8 +286,9 @@ class ScreenPrefetcher:
 
         注意**不动指纹** —— 点击之后马上要拿它和读到的界面比对，
         判断翻页到底发生没有。指纹就是"点击之前长什么样"。
-        也**不动 _last_seen** —— 它是"最近见过的界面"，给识别当上下文用，
-        翻页判断和识别提示都靠它。
+        也**不动 _last_seen**（连同它读到的时刻 `_last_seen_at`）—— 它是"最近见过的界面"，
+        给识别当上下文用，翻页判断和识别提示都靠它；按键那条「不等预读」的路
+        也靠它（见 grab_screen 的 allow_stale）。所以 `_at` 清零了、它不清。
         """
         with self._lock:
             self._snapshot = None
@@ -297,6 +308,28 @@ class ScreenPrefetcher:
         """
         with self._lock:
             return self._last_seen
+
+    def peek_with_age(self):
+        """
+        跟 peek() 一样看一眼最近见过的界面，但**把年龄一起带回来**：`(快照, 秒数)`。
+        一次都没读到过返回 None。
+
+        按键那条「不等预读」的路要用它（见 grab_screen 的 allow_stale）：
+        这一下用的是旧坐标，日志里得如实写出「那一屏是多少秒前读到的」——
+        用户要知道自己在冒多大的险。
+
+        **年龄按「那一屏读到的时刻」算**（`_last_seen_at`），不按缓存那一份的 `_at`。
+        两者平时相同，但点击之后 invalidate() 会把 `_at` 清零（缓存作废了）而
+        `_last_seen` 故意留着 —— 那一刻拿 `_at` 算，会得出一个「开机以来」那么大的数，
+        日志就成了假话（monotonic 是从开机算起的）。原因写在 __init__ 那段注释里。
+
+        另外**这里没有年龄上限**：超过 cache_max_age 的旧屏照样交出来，只如实报岁数。
+        这是取舍不是遗漏 —— 用户明确要求按键一律不等、不要「这一屏是不是太旧了」的保险。
+        """
+        with self._lock:
+            if self._last_seen is None:
+                return None
+            return self._last_seen, time.monotonic() - self._last_seen_at
 
     # ---------------------------------------------------------- 触发
 
@@ -538,16 +571,50 @@ def show_screen(snap, log=say):
             log(f"[屏幕] 当前屏幕上的文字（前 20 个）：{' / '.join(texts)}")
 
 
-def grab_screen(ctx, use_prefetch=True):
+def grab_screen(ctx, use_prefetch=True, allow_stale=False):
     """
     取当前屏幕并解析。返回 (快照, 来源说明)。
 
     来源说明会打进日志 —— 调试优化时得能一眼看出这次到底读没读屏。
+
+    ## allow_stale：按键那条路「不等」
+
+    `allow_stale=True` 是**按键**那条路（小键盘数字、「下一题」）要的：
+    缓存空的时候**不等预读**，直接用「最近读到的那一屏」的坐标点下去。
+    `allow_stale=False`（默认，语音那条路）行为一字未变 —— 照旧 take_or_wait()。
+
+    为什么按键要这样（用户实测的症状）：飞快连按两次小键盘时，**第二下的响应
+    被拖到新题目出现之后**。根因就是这里原来那句 `take_or_wait()`：缓存空、
+    预读正在跑时它睡在这儿（最多 8 秒），一直等到预读把新题读完 ——
+    第二下必然落在新题目上，感觉慢一拍。
+
+    用户明确选了这个取舍 —— 「不要吞掉我的按键，也不要安排它读屏之后，
+    **马上立刻执行**」。代价写清楚：要做到「立刻」，这一下就只能用
+    **上一次读到的那一屏**的坐标。这正是设计文档曾经推翻过的「坐标复用」，
+    但两者不是一回事：当初推翻它，是因为那是不读屏直接点、**根本不知道屏幕
+    长什么样**；**这里用的是最近一次真实读到的坐标**，只是不等到最新那一次。
+    用户接受这个取舍，他的两条理由：
+
+      1. 若是误触，间隔短、界面还没翻过去，这一下点在**已经答过的那道题**上，
+         同一个位置同一个选项，等于没反应；
+      2. 若不是误触，说明他已经看到新屏幕了 —— 而**选项位置是稳的**：
+         实测五个选项严格等距 188 像素，题干很长时整排挪 43 像素，
+         而行高 150、中心到行边还有 75 像素，不会跨到相邻选项。
+
+    **刻意不做时间保险**（不问「这一屏是不是太旧了」）—— 用户要求一律不等；
+    只把「多少秒前读到的」打进日志，让他自己知道冒了多大的险。
+
+    三档顺序（allow_stale 时）：
+      1. 缓存里有界面 → 用缓存（和以前一样，**这是常态**）；
+      2. 缓存空 → 不等预读，用 peek_with_age() 那份坐标，来源标「上一次读到的」；
+      3. peek 也是 None（从头到尾一次都没读到过，比如刚启动）→ 才当场读一次。
     """
     prefetcher = ctx["prefetcher"]
 
     if use_prefetch:
-        cached = prefetcher.take_or_wait()
+        # 按键路径用 take（拿到就走）；语音路径照旧 take_or_wait（等预读跑完）。
+        # 缓存里有东西时两者等价 —— take_or_wait 第一步就是 take。
+        cached = prefetcher.take() if allow_stale else prefetcher.take_or_wait()
         if cached is not None:
             snap, age = cached
             # 界面第二块的数据来源：把「手里那一屏」交给界面显示。
@@ -555,8 +622,20 @@ def grab_screen(ctx, use_prefetch=True):
             publish_screen(ctx, snap, "预读", age)
             return snap, f"预读，{age:.1f} 秒前读好的（没读屏）"
 
-    # 走到这里说明没有可用的预读结果（预读没做成 / 超时了 / 这是第一次操作）。
-    # 只能当场读一次 —— 但这是**兜底**，正常流程不该走到这里。
+        # 缓存是空的 —— 按键路径在这里**不等**，见上面那段取舍。
+        if allow_stale:
+            last = prefetcher.peek_with_age()
+            if last is not None:
+                snap, age = last
+                say(f"       [注意] 预读还没读完，这一下不等了 —— "
+                    f"用上一次读到那一屏的坐标（那一屏是 {age:.1f} 秒前读到的）")
+                # 界面第二块照样给一份，但来源如实写「上一次读到的」——
+                # 免得界面上看起来跟预读命中一模一样，用户不知道这次冒了险。
+                publish_screen(ctx, snap, "上一次读到的", age)
+                return snap, f"上一次读到的（{age:.1f} 秒前，没读屏、也没等预读）"
+
+    # 走到这里说明没有可用的预读结果（预读没做成 / 超时了 / 这是第一次操作，
+    # 连一次都没读到过）。只能当场读一次 —— 但这是**兜底**，正常流程不该走到这里。
     read_start = time.monotonic()
     xml = ctx["adb"].dump_ui()
     read_ms = (time.monotonic() - read_start) * 1000
@@ -1015,16 +1094,25 @@ def handle_numpad(number, ctx):
     """
     小键盘按下数字：点第 number 个选项。
 
-    用**屏幕上真实报出的坐标**去点 —— 不做任何坐标推算。
+    用的坐标**来自真实读屏**，不做任何推算。
 
     这条「不推算坐标」是踩坑之后定下来的。曾经做过两种方案：
-    用缓存坐标、用配置好的固定坐标，都跳过了读屏。但选项位置会随题干
+    用配置好的固定坐标、以及不读屏直接点，都跳过了读屏。但选项位置会随题干
     长短整体偏移（实测同一个选项见过 1375 和 1418 两个位置，差 43 像素，
     而行高只有 150），复用旧坐标会**静默点错** —— 点了、没报错、但不是你要的。
 
     提速的正解不是「跳过读屏」，而是**把读屏提前做**：点完立刻在后台把下一屏
     读好（见 ScreenPrefetcher），按键时直接用那份结果 —— 坐标依然是系统报的
-    当前值，一点没「猜」。只有没预读成时才当场读一次兜底（日志会明说）。
+    当前值，一点没「猜」。
+
+    2026-09-28（用户实测后定的取舍）：**预读还没读完时不再等它**，直接用
+    「最近读到的那一屏」的坐标点下去（`allow_stale=True`，取舍与代价见
+    grab_screen 里那段注释）。原来这里是等（take_or_wait，最多 8 秒），于是
+    飞快连按两下小键盘时**第二下被拖到新题目出来之后**才执行。用户要求
+    「不要吞键、也不要排到读屏之后，马上立刻执行」，并接受「用上一次读到的
+    坐标」这个代价 —— 理由是选项位置很稳（严格等距 188 像素，题干很长时整排
+    挪 43 像素，行高 150、中心到行边还有 75 像素）。日志会写明那一屏是多少
+    秒前读到的。只有**连一次都没读到过**时（比如刚启动）才当场读一次兜底。
 
     按键一律生效，不吞。2026-09-28 之前这里还会核对一个「动作时戳」——
     按键那一刻记下屏幕指纹，执行前比对，不一样就不点。但真机日志证明它误伤了
@@ -1034,7 +1122,7 @@ def handle_numpad(number, ctx):
     started = time.monotonic()
 
     try:
-        snap, source = grab_screen(ctx)
+        snap, source = grab_screen(ctx, allow_stale=True)
     except AdbError as exc:
         say(f"[屏幕] {exc}")
         return
@@ -1065,6 +1153,15 @@ def handle_next(ctx, source="小键盘 0"):
 
     配置里给了 fixed_next_position 就直接点那个坐标；
     没给就读屏去找——找按钮比找选项宽松得多，代价是一次读屏。
+
+    2026-09-28：按键那条路和 `handle_numpad` 一样改成 `allow_stale=True` ——
+    预读还没读完也不等，直接用「最近读到的那一屏」去找按钮（用户要求按键
+    一律立刻执行）。**这条路和数字键有个区别要留意**：「下一题」按钮只长在
+    详情页上，若手里那一屏还是答题页，`next_button` 就是 None，这一下会走
+    「没找到「下一题」按钮」那条提示、不点任何东西（等预读读完再按一下即可）。
+    换句话说数字键那种「位置很稳、用旧坐标照样点对」的性质，这条路并不总是成立 ——
+    好在出厂配置里 `fixed_next_position` 是有值的，真机走的是上面那条固定坐标的
+    短路，根本不会读屏。这里的取舍与代价见 grab_screen 里那段注释。
     """
     say(f"[{source}] 下一题")
     started = time.monotonic()
@@ -1102,7 +1199,7 @@ def handle_next(ctx, source="小键盘 0"):
         return
 
     try:
-        snap, source = grab_screen(ctx)
+        snap, source = grab_screen(ctx, allow_stale=True)
     except AdbError as exc:
         say(f"[屏幕] {exc}")
         return

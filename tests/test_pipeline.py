@@ -63,6 +63,26 @@ DETAIL_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
 """
 
 
+# 一屏「选项挪得很低」的答题界面 —— 专门用来分辨**这一下点的是哪一份界面的坐标**。
+#
+# 它和 GRE_XML 的第一个选项文字一模一样（都是「adj. 清晰易懂的」），但整排挪到了
+# 屏幕下半部分（y≈2005 而不是 811）。于是「用的是读来的屏」还是「用的是 peek 里
+# 那份旧屏」在点击坐标上一眼可辨 —— 光断言「读没读屏」是分不出来的。
+SHIFTED_OPTION_XML = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
+<hierarchy rotation="0">
+  <node index="0" text="" class="android.widget.FrameLayout" package="com.enhance.greapp"
+        clickable="false" bounds="[0,0][1212,2512]">
+    <node index="0" text="adj. 清晰易懂的" resource-id="com.enhance.greapp:id/tv_question"
+          class="android.widget.TextView" package="com.enhance.greapp"
+          clickable="true" bounds="[0,1930][1212,2080]" />
+    <node index="1" text="adj. 阴郁的，闷闷不乐的" resource-id="com.enhance.greapp:id/tv_question"
+          class="android.widget.TextView" package="com.enhance.greapp"
+          clickable="true" bounds="[0,2118][1212,2268]" />
+  </node>
+</hierarchy>
+"""
+
+
 # 哨兵：区分「没指定，从 XML 里推断」和「明确要模拟查不到」
 INFER_FROM_XML = object()
 
@@ -118,6 +138,7 @@ class StubPrefetcher:
         self.noted = 0
         self.cached = None      # 测试可以塞一份进去，模拟「已经预读好了」
         self.peeked = None      # 测试可以塞一份进去，模拟「最近见过的那一屏」
+        self.peeked_age = 0.0   # 上面那一屏是多少秒前读到的（日志里要打出来）
         self._miss = "还没有预读结果"
 
     def take(self):
@@ -149,6 +170,17 @@ class StubPrefetcher:
         核对前台应用（设计 §6.1 的护栏）。默认 None = 还没有任何界面数据。
         """
         return self.peeked
+
+    def peek_with_age(self):
+        """
+        跟 peek() 一样，只是把「那一屏是多少秒前读到的」一起带回来。
+
+        按键那条「不等预读」的路要用它写日志（让用户知道自己在冒多大的险）。
+        默认 None = 一次都没读到过 —— 这时调用方只能老老实实当场读一次。
+        """
+        if self.peeked is None:
+            return None
+        return self.peeked, self.peeked_age
 
     def trigger_after_click(self):
         self.after_click_triggers += 1
@@ -791,6 +823,74 @@ class TestCachedScreenIsUsed(unittest.TestCase):
 
         self.assertEqual(fake.dump_calls, 0, "有预读就不该再读屏")
         self.assertEqual(fake.taps, [(600, 2180)])
+
+
+class TestKeyPressUsesLastSeenScreen(unittest.TestCase):
+    """
+    按键不再等预读 —— 缓存空就直接用「最近读到的那一屏」的坐标点。
+
+    用户实测确认的症状：飞快连按两次小键盘，**第二下的响应被拖到新题目出现之后**。
+    根因就是 `grab_screen` 里那句 `take_or_wait()`：缓存空、预读正在跑时它睡在那儿
+    （最多 8 秒），一直等到预读把新题读完 —— 第二下必然落在新题目上，感觉慢一拍。
+
+    用户明确选了这个取舍（理由与代价写在 `grab_screen` 的注释里）：
+    不要吞键、也不要排到读屏之后，**马上立刻执行**；代价是这一下只能用
+    上一次读到的那一屏的坐标。他能接受，因为选项位置是稳的（实测五个选项
+    严格等距 188 像素，题干很长时整排挪 43 像素，而行高 150、中心到行边还有
+    75 像素 —— 不会跨到相邻选项）。他也明确**不要**时间保险，一律不等。
+
+    **第一条是这次改动的主证据**：改之前它要么等、要么当场读，总之
+    `dump_calls > 0`；改之后必须是 0。
+    """
+
+    def test_numpad_clicks_with_last_seen_screen_without_reading(self):
+        ctx, fake = make_ctx(GRE_XML)
+        snap = screen.read_screen(GRE_XML)
+        ctx["prefetcher"].peeked = snap        # 缓存是空的，但最近读到过这一屏
+        expected = snap.options[2]             # 第 3 个选项
+
+        app.handle_numpad(3, ctx)
+
+        self.assertEqual(fake.dump_calls, 0,
+                         "按键路径不该等预读、更不该当场读屏 —— 一次屏都不该读")
+        self.assertEqual(fake.taps, [(expected.x, expected.y)],
+                         "应该用「最近读到那一屏」第 3 个选项的坐标点下去")
+
+    def test_numpad_reads_when_nothing_was_ever_seen(self):
+        """
+        从头到尾一次都没读到过（比如刚启动）—— 没有旧坐标可用，只能当场读一次。
+
+        这是新逻辑的第三档：缓存空 → peek 也是 None → 才读。
+        """
+        ctx, fake = make_ctx(GRE_XML)
+        # peeked 默认就是 None，不用塞
+        expected = screen.read_screen(GRE_XML).options[2]
+
+        app.handle_numpad(3, ctx)
+
+        self.assertGreaterEqual(fake.dump_calls, 1,
+                                "一次都没读到过时仍然要当场读一次，不能什么都不干")
+        self.assertEqual(fake.taps, [(expected.x, expected.y)],
+                         "读完之后照常点第 3 个选项")
+
+    def test_speech_path_is_unchanged(self):
+        """
+        语音那条路**取舍没变**：缓存空就当场读屏，不用 peek 那份旧坐标。
+
+        这里故意让 peek 里那份屏和真读到的屏**选项位置明显不同**（都在屏幕下方
+        y≈2005，而真实的在 y=811）—— 于是「点出来的 y」直接说明用了哪一份坐标：
+        走对了就是 811，误用 peek 就是 2005。
+        """
+        ctx, fake = make_ctx(GRE_XML)
+        ctx["prefetcher"].peeked = screen.read_screen(SHIFTED_OPTION_XML)
+        expected = screen.read_screen(GRE_XML).options[0]
+
+        app.handle_speech("清晰", -0.4, ctx)
+
+        self.assertGreaterEqual(fake.dump_calls, 1,
+                                "语音这条路没改：缓存空就当场读屏，不等也不复用旧坐标")
+        self.assertEqual(fake.taps, [(expected.x, expected.y)],
+                         "语音点的是刚读到的第 1 个选项，不是 peek 里那份旧屏的位置")
 
 
 class TestStartupProbe(unittest.TestCase):

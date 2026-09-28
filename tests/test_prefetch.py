@@ -307,6 +307,70 @@ class TestPeek(unittest.TestCase):
         self.assertIs(prefetcher.peek(), snap)
 
 
+class TestPeekWithAge(unittest.TestCase):
+    """
+    `peek_with_age()`：跟 peek 一样，外加「那一屏是多少秒前读到的」。
+
+    按键那条「不等预读」的路要拿这个年龄写日志 —— 用户要看的是
+    「我这一下用的是多少秒前的坐标，冒了多大的险」。
+
+    年龄**必须从那一屏读到的时刻算**，不能拿缓存那一份的 `_at`：
+    点击之后 `invalidate()` 会把 `_at` 清零（缓存作废了），而 `_last_seen`
+    是故意留着不动的（翻页判断和识别上下文都靠它）。那一刻两者已经不是
+    一回事了 —— 用 `_at` 会喊出一个「开机以来」那么大的数（monotonic 从开机算起），
+    正是这两条测试要拦住的。
+
+    另外：**年龄没有上限**，这是用户明确要求的「不做时间保险、一律不等」。
+    下面最后一条把这件事钉住 —— 它是刻意不要，不是漏了。
+    """
+
+    def test_none_before_anything_seen(self):
+        prefetcher, _adb, _logs, _cfg = make_prefetcher()
+        self.assertIsNone(prefetcher.peek_with_age())
+
+    def test_age_counts_from_when_that_screen_was_read(self):
+        prefetcher, _adb, _logs, _cfg = make_prefetcher()
+        snap = screen.read_screen(FIRST_XML)
+        prefetcher.note(snap, read_at=time.monotonic() - 3.0)
+
+        got = prefetcher.peek_with_age()
+
+        self.assertIsNotNone(got)
+        self.assertIs(got[0], snap)
+        self.assertAlmostEqual(got[1], 3.0, delta=1.0,
+                               msg="年龄要从那一屏读到的时刻算起")
+
+    def test_age_survives_invalidate(self):
+        """作废缓存不能把年龄的基准一起清掉（`_at` 会被清零，`_last_seen_at` 不会）"""
+        prefetcher, _adb, _logs, _cfg = make_prefetcher()
+        snap = screen.read_screen(FIRST_XML)
+        prefetcher.note(snap, read_at=time.monotonic() - 2.0)
+
+        prefetcher.invalidate()
+
+        got = prefetcher.peek_with_age()
+        self.assertIs(got[0], snap)
+        self.assertAlmostEqual(
+            got[1], 2.0, delta=1.0,
+            msg="作废之后年龄仍应从那一屏读到的时刻算，不能变成「开机以来」")
+
+    def test_no_age_limit_by_design(self):
+        """
+        **刻意没有年龄上限** —— 用户要求「一律不等、不问这一屏是不是太旧了」。
+
+        所以哪怕这一屏早就超过 `cache_max_age`（缓存那一份已经过期、take() 取不到了），
+        peek_with_age() 照样把它交出来，只把年龄如实报出来。这是取舍，不是 bug。
+        """
+        prefetcher, _adb, _logs, _cfg = make_prefetcher()
+        snap = screen.read_screen(FIRST_XML)
+        prefetcher.note(snap, read_at=time.monotonic() - 60.0)
+
+        self.assertIsNone(prefetcher.take(), "这一份早就超过 cache_max_age 了")
+        got = prefetcher.peek_with_age()
+        self.assertIs(got[0], snap, "按键那条路要的是「有旧坐标能用」，不是「够不够新」")
+        self.assertGreater(got[1], 30.0, "年龄要如实报出来，用户得知道自己冒了多大的险")
+
+
 class TestTriggerAfterClick(unittest.TestCase):
 
     def test_reads_until_screen_changes(self):

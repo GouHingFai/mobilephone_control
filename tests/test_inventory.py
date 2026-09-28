@@ -57,7 +57,13 @@ BASELINE_COUNTS = {
     # 按钮文字含快捷键、快捷键取自 cfg.hotkey、没快捷键的控件不带后缀、
     # 识别语言文字跟着当前语言变、两行三列的布局、每个按钮都带意图名，
     # 以及 cycle_language / toggle_voice_commands 两条真接线和 unwired_intents 三条。
-    "tests.test_pipeline": 120,
+    # 2026-09-28（任务 7）：120 → 123 —— 按键不再等预读（用最近读到那一屏的坐标立刻点）。
+    # 新增 TestKeyPressUsesLastSeenScreen 三条：
+    #   「缓存空时按键一次屏都不读、直接用最近读到那一屏第 3 个选项的坐标点」
+    #   「一次都没读到过时才当场读一次」（这一档行为未变，是护栏）
+    #   「语音那条路没被改：缓存空仍然当场读屏，不用 peek 的旧坐标」
+    # 第一条是这次改动的主证据（改之前 dump_calls == 1，改之后 == 0）。
+    "tests.test_pipeline": 123,
     # 26 → 27：预读改成「最多读两次」（见 test_prefetch.py）。原有的
     # 「试满次数再放弃」改写成「一直没变也收下」（1 条），另加「读到新界面只读一次」（1 条），
     # 共 +1。
@@ -67,7 +73,13 @@ BASELINE_COUNTS = {
     #   「第二次读还在路上时若发生了点击（换代），这一份必须作废、不许写回缓存」
     # 两条都靠测试里的 BlockingAdb（第二次 dump_ui 阻塞在 Event 上）把时序钉死，
     # 不靠 sleep 碰运气。净 +2。
-    "tests.test_prefetch": 29,
+    # 2026-09-28（任务 7）：29 → 33 —— 新增 peek_with_age()（带年龄的「最近见过那一屏」），
+    # 落成 TestPeekWithAge 四条：从没读到过返回 None、年龄按那一屏读到的时刻算、
+    # **作废缓存后年龄仍从那一屏读到的时刻算**（invalidate 会把 `_at` 清零而
+    # `_last_seen_at` 不清，混用会喊出「开机以来」那么大的数）、以及
+    # 「超过 cache_max_age 也照样交出来」——最后这条钉的是用户明确要的
+    # 「不做时间保险、一律不等」，是取舍不是遗漏。净 +4。
+    "tests.test_prefetch": 33,
     "tests.test_screen": 27,
     # 7：UiState（线程安全状态黑板）—— 界面与主逻辑唯一的交汇点
     "tests.test_ui_state": 7,
@@ -83,6 +95,10 @@ REQUIRED_CLASSES = {
         "TestNextButton",                  # 答错后能翻回下一题
         "TestPrefetchIsTriggeredAfterClick",
         "TestCachedScreenIsUsed",          # 预读的界面要被真正用上
+        # 2026-09-28（任务 7）：按键「不等预读、直接用最近读到那一屏的坐标」是本轮
+        # 唯一重新引入「用旧坐标点新题」风险的决定（用户明确选的取舍）。这一整类
+        # 就是那道风险的记录：删掉它，改动本身就没有任何用例能拦住回归了。
+        "TestKeyPressUsesLastSeenScreen",  # 按键不等预读；语音那条路的取舍不变
         "TestStartupProbe",                # 启动那一屏要被缓存（省掉第一次读屏）
         "TestActionWiring",                # 入队 → 解包分派这条接线
         "TestForceRead",                   # 小键盘 . 强制重新读屏
