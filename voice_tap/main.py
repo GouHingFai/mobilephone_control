@@ -125,6 +125,14 @@ class ScreenPrefetcher:
         self._last_seen = None      # 最近见过的界面（不消费，给识别当上下文用）
         self._busy = False
         self._miss = "还没有预读结果"  # 上次 take 落空的原因
+        # 「代数」：每作废一次缓存就 +1。
+        #
+        # 预读跑在后台，一次预读可能跨过好几次点击。结果返回时怎么知道它还
+        # 算不算数？**一次预读的结果只对「它开始时的那一代」有效** —— 期间
+        # 只要又点了一下（invalidate 换代），这份结果就是点击前的那一屏，
+        # 写回缓存会让下一次按键拿着过期坐标去点（本项目最忌讳的「静默点错」）。
+        # 靠一个只增不减的整数就能把这个时序关系钉死，比时间戳可靠。
+        self._generation = 0
 
     # ---------------------------------------------------------- 指纹
 
@@ -155,12 +163,40 @@ class ScreenPrefetcher:
         """
         read_at = time.monotonic() if read_at is None else read_at
         with self._lock:
-            if self._at and read_at < self._at:
-                return          # 这次读得比手上这份还早，丢弃
-            self._snapshot = snap
-            self._at = read_at
-            self._signature = self.signature(snap)
-            self._last_seen = snap
+            self._store_locked(snap, read_at)
+
+    def _store_locked(self, snap, read_at):
+        """
+        真正写缓存与指纹的那一步。**调用方必须已经持有 self._lock。**
+
+        抽出来是为了让「核对代数」和「写入」待在**同一把锁**里 ——
+        否则「核对完、还没写、又被 invalidate 换代」这个缝隙里，
+        旧屏还是会被写回去，护栏就白加了。
+        """
+        if self._at and read_at < self._at:
+            return False        # 这次读得比手上这份还早，丢弃
+        self._snapshot = snap
+        self._at = read_at
+        self._signature = self.signature(snap)
+        self._last_seen = snap
+        return True
+
+    def note_if_current(self, snap, generation, read_at=None):
+        """
+        只在「还是这次预读开始时的那一代」时才收下 —— 收下了返回 True，
+        已经换代（预读作废）返回 False。
+
+        后台预读专用，理由见 __init__ 里 `_generation` 那段：
+        **一次预读的结果只对它开始时的那一代有效。** 预读跑在后台，期间
+        用户完全可能又按了一下键（do_click → invalidate → 换代），此刻这份
+        结果就是**点击前那一屏**。写进缓存的话，下一次按键会拿着过期坐标
+        去点 —— 点了、不报错、但点的不是地方，正是本项目最忌讳的「静默点错」。
+        """
+        read_at = time.monotonic() if read_at is None else read_at
+        with self._lock:
+            if generation != self._generation:
+                return False
+            return self._store_locked(snap, read_at)
 
     def take(self):
         """
@@ -232,7 +268,11 @@ class ScreenPrefetcher:
 
     def invalidate(self):
         """
-        作废缓存。
+        作废缓存，**并换代**（`_generation += 1`）。
+
+        换代的用处是让**还在路上的那次后台预读**知道自己已经不作数了 ——
+        预读返回时会拿它开始时的代数跟现在比，不一样就把结果丢掉
+        （见 note_if_current），绝不把点击前那一屏写回缓存。
 
         注意**不动指纹** —— 点击之后马上要拿它和读到的界面比对，
         判断翻页到底发生没有。指纹就是"点击之前长什么样"。
@@ -243,6 +283,8 @@ class ScreenPrefetcher:
             self._snapshot = None
             self._at = 0.0
             self._miss = "刚点击过，缓存已作废（界面要翻页了）"
+            # 作废即换代：此刻所有还在跑的预读，结果一律作废。
+            self._generation += 1
 
     def peek(self):
         """
@@ -291,11 +333,30 @@ class ScreenPrefetcher:
                 return
             self._busy = True
             before = self._signature
+            # 记下「这次预读是哪一代开始的」。往后每一次收结果都要核这个数 ——
+            # 中途只要又点了一下（invalidate 换代），这份结果就过期了，
+            # 绝不能写进缓存。理由见 __init__ 里 `_generation` 那段。
+            generation = self._generation
 
         def work():
             delay = self.cfg.click_delay_ms / 1000.0
             retry = self.cfg.click_retry_ms / 1000.0
             started = time.monotonic()
+
+            def store(snap, read_at):
+                """
+                收下这次读屏的结果。**每次收结果之前都核对代数。**
+
+                换代了（期间用户又点了一下）就把这份丢掉并说明白 ——
+                它反映的是点击前那一屏，写回缓存会让下一次按键拿着过期坐标
+                去点。收下了返回 True，作废了返回 False。
+                """
+                if self.note_if_current(snap, generation, read_at=read_at):
+                    return True
+                self.log("       [预读] 期间又点了一下，这次预读作废"
+                         "（结果反映的是点击前那一屏，不收）")
+                return False
+
             try:
                 time.sleep(delay)
                 read_start = time.monotonic()
@@ -307,19 +368,31 @@ class ScreenPrefetcher:
                 read_ms = (time.monotonic() - read_start) * 1000
 
                 if before is None or self.signature(snap) != before:
-                    self.note(snap, read_at=read_start)
+                    if not store(snap, read_start):
+                        return
                     self.log(f"       [预读] 读到新界面，"
                              f"距点击 {(time.monotonic() - started) * 1000:.0f} 毫秒"
                              f"（本次读屏 {read_ms:.0f} 毫秒）")
                     return
 
-                # 和点击前一样：再读一次确认。
+                # 和点击前一样：**先把这一份收下来**，再去读第二次确认。
                 #
-                # **只确认一次，不再有第 3、4 次。** 理由（用户提出、日志支持）：
+                # 为什么不压着不存（原来是「不存 → 再读」）：连续两次读到同一屏，
+                # 就说明这就是当前屏幕（用户的原话），**所以第一份本来就是有效数据**——
+                # 没有理由压着不给等在这次预读上的按键用。
+                # 按键等在这里时，若还要它陪预读跑完「确认」那一次读（最长约 5 秒），
+                # 就正是用户抱怨的「答题快的时候按键被吞/被拖」。先收下，按键立刻能
+                # 用它走人；第二次读到什么，再覆盖成什么。
+                #
+                # **确认只做这一次，不再有第 3、4 次。** 理由（用户提出、日志支持）：
                 # 连续两次读到同一屏，就说明这就是当前屏幕 —— 继续读不会读到别的，
                 # 只会白耗时间（每次读屏约 2.4 秒），而这段时间用户的按键全被挡住。
                 # 真机日志里有 5 次白读满 4 遍，最长拖了 16.8 秒。
-                self.log(f"       [预读] 还是旧界面，再读一次确认"
+                if not store(snap, read_start):
+                    # 这一份在收的过程中发现已经换代（期间又点了一下）——
+                    # 按「作废就收工」办：别再往下读第二次了，读回来也一样不作数。
+                    return
+                self.log(f"       [预读] 还是旧界面，先收下这一份，再读一次确认"
                          f"（距点击 {(time.monotonic() - started) * 1000:.0f} 毫秒）")
                 time.sleep(retry)
                 read_start = time.monotonic()
@@ -332,7 +405,10 @@ class ScreenPrefetcher:
                 elapsed = (time.monotonic() - started) * 1000
 
                 # 第二次无论读到什么，都收下 —— 它反映的就是当下这一屏。
-                self.note(snap, read_at=read_start)
+                # 但收之前同样要核对代数：按键可能已经把第一份抢走、点下去了，
+                # 这时候这一份就是点击前那一屏，必须作废（见上面的 store）。
+                if not store(snap, read_start):
+                    return
                 if self.signature(snap) == before:
                     self.log(f"       [预读] 两次一样，认定这就是当前屏，收下"
                              f"（距点击 {elapsed:.0f} 毫秒，本次读屏 {read_ms:.0f} 毫秒）")

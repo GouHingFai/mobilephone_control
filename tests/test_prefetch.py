@@ -15,6 +15,7 @@ test_prefetch.py —— 预读界面
     所以核心机制是「读到和点击前不一样了才算数」。下面的测试把这条钉住。
 """
 
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -42,6 +43,34 @@ class SequenceAdb:
         return self.xmls[index]
 
 
+class BlockingAdb:
+    """
+    第二次 `dump_ui()` 会**阻塞**，由测试决定什么时候放行。
+
+    用它把时序钉死。本任务要测的是「预读正卡在第二次读上」这一刻里发生的事情
+    （按键取走第一份、或者点击换代）—— 靠 sleep 去凑那一刻，机器一快一慢
+    结论就飘了；阻塞住则是确定的，这一刻里发生的事都能被可靠复现。
+
+    `entered_second`：预读已经进到第二次读里了（测试据此知道可以动手了）
+    `release`：测试放行，让第二次读返回
+    """
+
+    def __init__(self, *xmls):
+        self.xmls = list(xmls)
+        self.calls = 0
+        self.entered_second = threading.Event()
+        self.release = threading.Event()
+
+    def dump_ui(self, **kwargs):
+        self.calls += 1
+        index = min(self.calls - 1, len(self.xmls) - 1)
+        if self.calls == 2:
+            self.entered_second.set()
+            # 超时只是兜底，免得测试写错时把整个套件挂死
+            self.release.wait(timeout=5.0)
+        return self.xmls[index]
+
+
 def make_prefetcher(*xmls, **overrides):
     """造一个用极小延时的预读器，让测试跑得快"""
     cfg = Config()
@@ -66,6 +95,16 @@ def wait_idle(prefetcher, timeout=5.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not prefetcher._busy:
+            return True
+        time.sleep(0.005)
+    return False
+
+
+def wait_for(predicate, timeout=5.0):
+    """等某个条件成立。轮询事件，不靠 sleep 撞运气 —— 条件一成立就往下走。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
             return True
         time.sleep(0.005)
     return False
@@ -358,6 +397,87 @@ class TestTriggerAfterClick(unittest.TestCase):
 
         # 因为第二次被挡掉，总共只该读 1 次
         self.assertEqual(adb.calls, 1)
+
+
+class TestFirstReadIsUsableWhileConfirming(unittest.TestCase):
+    """
+    预读卡在「确认」那一次读上时，等在它上面的按键要能用**第一次**读到的结果。
+
+    这是本轮改动的目的：按键不必再陪预读跑完第二次读（每次读屏约 2.4 秒，
+    加上 retry 等待最长能拖到 5 秒）。物理下限是「最多等一次读屏」≈2.4 秒，
+    这次就是把它压到这个下限。
+
+    用户的原话：连续两次读到同一屏，就说明这就是当前屏幕 ——
+    第一份本来就是有效数据，没有理由压着不给等着的按键用。
+
+    两条用例都靠 `BlockingAdb` 把「第二次读还在路上」这一刻钉死，
+    不靠 sleep 去凑。
+    """
+
+    def make_blocking(self, *xmls, **overrides):
+        cfg = Config()
+        params = dict(
+            after_click=True,
+            click_delay_ms=1,
+            click_retry_ms=1,
+            cache_max_age=8.0,
+            on_speech=False,
+        )
+        params.update(overrides)
+        cfg.prefetch = PrefetchConfig(**params)
+
+        logs = []
+        adb = BlockingAdb(*xmls)
+        return app.ScreenPrefetcher(adb, cfg, log=logs.append), adb, logs
+
+    def test_first_read_is_usable_while_confirming(self):
+        """界面一直不变、预读卡在第二次读上时，take() 应该能拿到第一次读到的那一屏"""
+        prefetcher, adb, _logs = self.make_blocking(FIRST_XML, FIRST_XML)
+
+        prefetcher.note(screen.read_screen(FIRST_XML))   # 点击之前看到的
+        prefetcher.invalidate()
+        prefetcher.trigger_after_click()
+
+        self.assertTrue(wait_for(lambda: adb.entered_second.is_set()),
+                        "预读应该已经进到第二次读里（否则这条用例没测到点上）")
+        try:
+            got = prefetcher.take()
+            self.assertIsNotNone(
+                got, "第一次读到的就是当前屏，不该压着不给等着的按键用")
+            snap, _age = got
+            self.assertEqual(snap.prompt, "degrade",
+                             "取到的应该是第一次读到的那一屏")
+        finally:
+            adb.release.set()
+        self.assertTrue(wait_idle(prefetcher))
+
+    def test_confirm_read_is_discarded_if_a_click_happened(self):
+        """
+        第二次读还在路上时按下键 → 点击 → invalidate()（作废即换代）。
+        等第二次读返回，它带回来的是**点击前那一屏** —— 必须作废、不许写回缓存。
+
+        写回去的后果正是本项目最忌讳的「静默点错」：下一次按键拿着过期坐标
+        点下去，不报错、但点的是错的地方。
+        """
+        prefetcher, adb, logs = self.make_blocking(FIRST_XML, SECOND_XML)
+
+        prefetcher.note(screen.read_screen(FIRST_XML))
+        prefetcher.invalidate()
+        prefetcher.trigger_after_click()
+
+        self.assertTrue(wait_for(lambda: adb.entered_second.is_set()),
+                        "预读应该已经进到第二次读里")
+
+        # 模拟：用户按键抢走第一份 → 立刻点击 → do_click 作废缓存
+        prefetcher.invalidate()
+
+        adb.release.set()
+        self.assertTrue(wait_idle(prefetcher))
+
+        self.assertIsNone(
+            prefetcher.take(), "换代之后第二次读到的旧屏绝不许写回缓存")
+        self.assertTrue(any("作废" in line for line in logs),
+                        "这次预读被作废，日志里要说明白")
 
 
 class TestTriggerOnSpeech(unittest.TestCase):

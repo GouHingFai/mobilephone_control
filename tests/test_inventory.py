@@ -61,7 +61,13 @@ BASELINE_COUNTS = {
     # 26 → 27：预读改成「最多读两次」（见 test_prefetch.py）。原有的
     # 「试满次数再放弃」改写成「一直没变也收下」（1 条），另加「读到新界面只读一次」（1 条），
     # 共 +1。
-    "tests.test_prefetch": 27,
+    # 2026-09-28（任务 6）：27 → 29 —— 按键不必再等预读的「确认」那一次读。
+    # 新增 TestFirstReadIsUsableWhileConfirming 两条：
+    #   「预读卡在第二次读上时，第一次读到的就能被 take 走」
+    #   「第二次读还在路上时若发生了点击（换代），这一份必须作废、不许写回缓存」
+    # 两条都靠测试里的 BlockingAdb（第二次 dump_ui 阻塞在 Event 上）把时序钉死，
+    # 不靠 sleep 碰运气。净 +2。
+    "tests.test_prefetch": 29,
     "tests.test_screen": 27,
     # 7：UiState（线程安全状态黑板）—— 界面与主逻辑唯一的交汇点
     "tests.test_ui_state": 7,
