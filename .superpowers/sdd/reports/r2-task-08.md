@@ -149,8 +149,11 @@ AttributeError: module 'voice_tap.main' has no attribute 'make_screen_publisher'
 ## 提交哈希
 
 ```
-见 `git log -1`
+f8d8e9087263e8b7adafacb583ce9493793182db  fix: 预读读到的屏幕现在会立刻显示（界面+控制台），不再慢一拍
 ```
+
+（本报告另起一个 `docs:` 提交改这一行，与仓库既有「先 fix 再 docs 报告」的惯例一致 ——
+简报只给了一条 `git add -A && git commit` 命令，那样没法把 fix 提交的哈希写进报告里。）
 
 ## 我**没能**验证什么（这一节请务必当真）
 
