@@ -72,7 +72,14 @@ BASELINE_COUNTS = {
     #      publish_screen 必须去掉；两处都留着界面看着一样，只有次数分得出来）
     #   TestPrefetchedScreenReachesTheUiWithNoExtraKey 一条（**主证据**：
     #     只按一次键、之后不再有任何输入，界面里那一屏自己变成新题）
-    "tests.test_pipeline": 128,
+    # 2026-09-28（r2 任务 9）：128 → 130 —— 同一屏不再打两遍（用户实测：
+    # 「之前展示了预读的，为什么我点击后又要展示一次预读」）。动作路径上那两句
+    # 重复的 show_screen（handle_numpad / handle_speech）去掉之后，用
+    # TestSameScreenIsPrintedOnlyOnce 两条钉住「那一屏的题干只出现一次」：
+    #   按键那条路（handle_numpad）与语音那条路（handle_speech）各一条。
+    #   两条都走**真接线**（真 ScreenPrefetcher + make_screen_publisher），
+    #   把整段控制台输出收下来数一数；把 show_screen 加回去计数就变 2。
+    "tests.test_pipeline": 130,
     # 26 → 27：预读改成「最多读两次」（见 test_prefetch.py）。原有的
     # 「试满次数再放弃」改写成「一直没变也收下」（1 条），另加「读到新界面只读一次」（1 条），
     # 共 +1。
@@ -95,7 +102,14 @@ BASELINE_COUNTS = {
     #   同一屏不播两遍（「还是旧界面 → 再读一次确认」那条路会把同一屏存两次）、
     #   已经摆在界面上的一屏不再播（翻页没发生时控制台不被刷第二遍）、
     #   内容变了才播、被丢弃的旧读屏不许播（理由同「不许写回缓存」）。
-    "tests.test_prefetch": 40,
+    # 2026-09-28（r2 任务 9）：40 → 42 —— 连点两下时不再丢掉后来的预读请求
+    # （用户真机日志：两下过去一次预读都不剩，缓存空、也没人在读）。加
+    # TestDoubleClickDoesNotDropThePrefetch 两条：
+    #   「第二下之后按新代数重跑，缓存里是第二下之后读到的那一屏，且始终只有一个
+    #    dump 在跑」（**主证据**，用 BlockingAdb 把「卡在第二次读上」这一刻钉死）
+    #   「第二次 trigger_after_click() 要留下重启标记、并且真的兑现，不能静默丢掉」
+    # 旧代码下第一条断言「缓存里必须有东西」就红（缓存是空的）。
+    "tests.test_prefetch": 42,
     "tests.test_screen": 27,
     # 7：UiState（线程安全状态黑板）—— 界面与主逻辑唯一的交汇点
     "tests.test_ui_state": 7,

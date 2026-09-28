@@ -53,6 +53,8 @@ class BlockingAdb:
 
     `entered_second`：预读已经进到第二次读里了（测试据此知道可以动手了）
     `release`：测试放行，让第二次读返回
+    `max_concurrent`：**同时**进入 `dump_ui()` 的线程数峰值。用来钉住
+    「始终只有一个 dump 在跑」—— 连点两下时不许为每次点击另起一个读屏线程。
     """
 
     def __init__(self, *xmls):
@@ -60,15 +62,25 @@ class BlockingAdb:
         self.calls = 0
         self.entered_second = threading.Event()
         self.release = threading.Event()
+        self._track_lock = threading.Lock()
+        self._in_dump = 0
+        self.max_concurrent = 0
 
     def dump_ui(self, **kwargs):
-        self.calls += 1
-        index = min(self.calls - 1, len(self.xmls) - 1)
-        if self.calls == 2:
-            self.entered_second.set()
-            # 超时只是兜底，免得测试写错时把整个套件挂死
-            self.release.wait(timeout=5.0)
-        return self.xmls[index]
+        with self._track_lock:
+            self._in_dump += 1
+            self.max_concurrent = max(self.max_concurrent, self._in_dump)
+        try:
+            self.calls += 1
+            index = min(self.calls - 1, len(self.xmls) - 1)
+            if self.calls == 2:
+                self.entered_second.set()
+                # 超时只是兜底，免得测试写错时把整个套件挂死
+                self.release.wait(timeout=5.0)
+            return self.xmls[index]
+        finally:
+            with self._track_lock:
+                self._in_dump -= 1
 
 
 def make_prefetcher(*xmls, on_screen=None, **overrides):
@@ -456,14 +468,22 @@ class TestTriggerAfterClick(unittest.TestCase):
         self.assertIn("读屏", joined)
 
     def test_does_not_run_twice_concurrently(self):
+        """
+        同一时刻**只有一个**预读线程在跑。
+
+        第二次 `trigger_after_click()` 不再被丢掉，而是记一个「重启」标记
+        （见 TestDoubleClickDoesNotDropThePrefetch）；但**这一轮正常收工**
+        （没有换代）时标记不会被兑现，所以这里仍旧只该读一次 ——
+        绝不会有两个线程同时对手机下 dump 命令。
+        """
         prefetcher, adb, _logs, _cfg = make_prefetcher(FIRST_XML, SECOND_XML)
 
         prefetcher.trigger_after_click()
-        prefetcher.trigger_after_click()      # 第二次应该被挡掉
+        prefetcher.trigger_after_click()      # 记下重启标记（本轮正常收工，不兑现）
         self.assertTrue(wait_idle(prefetcher))
         time.sleep(0.05)
 
-        # 因为第二次被挡掉，总共只该读 1 次
+        # 只有一轮在跑，且这一轮正常收工，总共只该读 1 次
         self.assertEqual(adb.calls, 1)
 
 
@@ -483,20 +503,7 @@ class TestFirstReadIsUsableWhileConfirming(unittest.TestCase):
     """
 
     def make_blocking(self, *xmls, **overrides):
-        cfg = Config()
-        params = dict(
-            after_click=True,
-            click_delay_ms=1,
-            click_retry_ms=1,
-            cache_max_age=8.0,
-            on_speech=False,
-        )
-        params.update(overrides)
-        cfg.prefetch = PrefetchConfig(**params)
-
-        logs = []
-        adb = BlockingAdb(*xmls)
-        return app.ScreenPrefetcher(adb, cfg, log=logs.append), adb, logs
+        return make_blocking_prefetcher(*xmls, **overrides)
 
     def test_first_read_is_usable_while_confirming(self):
         """界面一直不变、预读卡在第二次读上时，take() 应该能拿到第一次读到的那一屏"""
@@ -546,6 +553,123 @@ class TestFirstReadIsUsableWhileConfirming(unittest.TestCase):
             prefetcher.take(), "换代之后第二次读到的旧屏绝不许写回缓存")
         self.assertTrue(any("作废" in line for line in logs),
                         "这次预读被作废，日志里要说明白")
+
+
+def make_blocking_prefetcher(*xmls, on_screen=None, **overrides):
+    """
+    造一个用 `BlockingAdb`（第二次读屏会阻塞）的预读器，延时刻意调到最小。
+
+    `on_screen` 见 `make_prefetcher`；不传 = 老行为（只存不播）。
+    返回 `(预读器, adb, 日志)`。
+    """
+    cfg = Config()
+    params = dict(
+        after_click=True,
+        click_delay_ms=1,
+        click_retry_ms=1,
+        cache_max_age=8.0,
+        on_speech=False,
+    )
+    params.update(overrides)
+    cfg.prefetch = PrefetchConfig(**params)
+
+    logs = []
+    adb = BlockingAdb(*xmls)
+    prefetcher = app.ScreenPrefetcher(adb, cfg, log=logs.append, on_screen=on_screen)
+    return prefetcher, adb, logs
+
+
+class TestDoubleClickDoesNotDropThePrefetch(unittest.TestCase):
+    """
+    **本轮缺陷一的证据**（用户提供的真机日志）：
+
+        [小键盘] 2
+               [注意] 预读还没读完，这一下不等了 —— 用上一次读到那一屏的坐标（4.4 秒前读到的）
+        [匹配] 小键盘第 2 个 → 点击坐标 (606, 999)
+        [点击] 完成
+               [预读] 期间又点了一下，这次预读作废（结果反映的是点击前那一屏，不收）
+
+    连点两下之后，**一次预读都不剩** —— 缓存空、也没人在读。用户看到的
+    「读屏内容变成之前的了」就是这个。
+
+    时序（旧写法）：
+      1. 第一下 → 启动预读（第 N 代）；
+      2. 第二下 → invalidate()（换到第 N+1 代）+ trigger_after_click()
+         → 发现 `_busy` → **把这次请求直接丢掉**；
+      3. 第 N 代读完了 → 核对代数发现换了代 → 作废不收。
+
+    要的行为（用户原话）：**每次点击都要立刻中止之前的预读、并且重新开始预读**。
+    约束：**不能**为每次点击另起一个 dump 线程（实测两个 `uiautomator dump`
+    同时对同一台手机下命令，会把单次读屏从 2.4 秒拖到 8.5 秒）。所以做法是
+    「重启请求」标记：正在跑的那次一发现自己作废，就在**同一个线程里**按当前
+    代数与当前指纹重跑一遍。
+
+    两条用例都用 `BlockingAdb` 把「预读卡在第二次读上」这一刻钉死，
+    不靠 sleep 碰运气。
+    """
+
+    def test_second_click_reruns_and_caches_the_screen_read_after_it(self):
+        """**主证据**：连点两下之后，缓存里是「第二下之后才读到的那一屏」"""
+        # call1 = 第一下之后读到旧屏（跟点击前一样）→ 先收下 + 去读第二次
+        # call2 = 卡住（第二次读），测试就趁这一刻点第二下
+        # call3 = 第二下之后读到的新屏
+        prefetcher, adb, _logs = make_blocking_prefetcher(
+            FIRST_XML, FIRST_XML, SECOND_XML)
+
+        prefetcher.note(screen.read_screen(FIRST_XML))   # 第一下之前那一屏
+        prefetcher.invalidate()                          # 第一下
+        prefetcher.trigger_after_click()                 # 第一下：启动预读
+        self.assertTrue(wait_for(lambda: adb.entered_second.is_set()),
+                        "预读应该已经进到第二次读里（否则这条用例没测到点上）")
+
+        prefetcher.invalidate()                          # 第二下：换代
+        prefetcher.trigger_after_click()                 # 第二下：请求预读
+
+        adb.release.set()
+        self.assertTrue(wait_idle(prefetcher))
+
+        cached = prefetcher.take()
+        self.assertIsNotNone(
+            cached,
+            "连点两下之后缓存里必须有东西 —— 旧写法这里是空的："
+            "第一下的结果作废了，第二下的请求又被丢掉")
+        self.assertEqual(cached[0].prompt, "prototype",
+                         "缓存的必须是**第二下之后**才读到的那一屏")
+        self.assertEqual(adb.calls, 3,
+                         "第一轮两次读 + 按新代数重跑一次读 —— 共 3 次")
+        self.assertEqual(adb.max_concurrent, 1,
+                         "始终只有一个 dump 在跑（不许为每次点击另起读屏线程）")
+
+    def test_second_click_is_remembered_not_silently_dropped(self):
+        """
+        第二次 `trigger_after_click()` **不能静默什么都不做**。
+
+        旧写法在 `_busy` 时直接 `return`，请求就这么没了 —— 一点痕迹都不留。
+        新写法至少要把这次请求记下来（「重启」标记置上），而且**要真的兑现**：
+        放行之后缓存里必须是第二下之后读到的那一屏。
+        """
+        prefetcher, adb, _logs = make_blocking_prefetcher(
+            FIRST_XML, FIRST_XML, SECOND_XML)
+
+        prefetcher.note(screen.read_screen(FIRST_XML))
+        prefetcher.invalidate()
+        prefetcher.trigger_after_click()
+        self.assertTrue(wait_for(lambda: adb.entered_second.is_set()))
+
+        prefetcher.invalidate()
+        prefetcher.trigger_after_click()
+
+        self.assertTrue(prefetcher._restart,
+                        "第二次请求要留下「重启」标记，不能静默丢掉")
+
+        adb.release.set()
+        self.assertTrue(wait_idle(prefetcher))
+
+        cached = prefetcher.take()
+        self.assertIsNotNone(cached, "记下的请求要兑现 —— 缓存里得有东西")
+        self.assertEqual(cached[0].prompt, "prototype",
+                         "兑现的就是「第二下之后读到的那一屏」")
+        self.assertFalse(prefetcher._restart, "兑现之后标记要清掉，免得影响下一轮")
 
 
 class RecordingOnScreen:

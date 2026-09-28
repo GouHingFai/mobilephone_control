@@ -169,6 +169,16 @@ class ScreenPrefetcher:
         # 一个「开机以来」那么大的数（monotonic 从开机算起），日志就成了假话。
         self._last_seen_at = 0.0
         self._busy = False
+        # 「重启请求」：已经有一次预读在跑时，又来了一次点击 —— **不丢掉这次请求**，
+        # 只把这里置上。正在跑的那次预读一旦发现自己这代的活已经作废（期间点过键、
+        # invalidate 换过代），就会看到这个标记，在**同一个线程里**按当前代数与当前
+        # 指纹重跑一遍（见 trigger_after_click 的 work）。
+        #
+        # 为什么不干脆为每次点击另起一个线程：两个 `uiautomator dump` 同时对同一台
+        # 手机下命令，实测把单次读屏从 2.4 秒拖到 8.5 秒（见 take_or_wait 的注释）。
+        # 用标记 + 同一线程循环，就既做到了「最后一次点击一定有一次针对它的预读」，
+        # 又始终只有一个 dump 在跑。
+        self._restart = False
         self._miss = "还没有预读结果"  # 上次 take 落空的原因
         # 「代数」：每作废一次缓存就 +1。
         #
@@ -436,107 +446,159 @@ class ScreenPrefetcher:
         threading.Thread(target=work, daemon=True, name="prefetch-on-speech").start()
 
     def trigger_after_click(self):
-        """点击之后预读：读到新界面就收工；还是旧界面就再读一次确认，最多两次"""
+        """
+        点击之后预读：读到新界面就收工；还是旧界面就再读一次确认，最多两次。
+
+        **连点两下不再丢掉后来的请求**（用户实测缺陷）。它原来一发现 `_busy`
+        就直接 `return`，于是时序成了：
+
+            第一下 → 启动预读（第 N 代）；
+            第二下 → invalidate()（换到第 N+1 代）+ 这次调用发现忙 → **请求被丢掉**；
+            第 N 代读完了 → 核对代数发现换了代 → 作废不收。
+
+        两下过去，**一次预读都不剩**：缓存空、也没人在读 —— 用户看到的就是
+        「读屏内容变成之前的了」。现在改成置一个「重启请求」（`_restart`）：
+        正在跑的那次一发现自己作废，就在**同一个线程里**按当前代数与当前指纹
+        重跑一遍。为什么不能为每次点击另起线程（两个 dump 同时下命令会把单次
+        读屏从 2.4 秒拖到 8.5 秒），见 __init__ 里 `_restart` 那段。
+        """
         if not self.cfg.after_click:
             return
 
         with self._lock:
             if self._busy:
+                # 已经有一次预读在跑 —— **不丢掉这次请求**，只置上「重启」标记。
+                # 它本来就落在「新的一代」上了（点击那条路一定先调过 invalidate），
+                # 所以正在跑的那次一发现自己作废，就会按这个新代数重跑（见 work）。
+                self._restart = True
                 return
             self._busy = True
-            before = self._signature
+            self._restart = False
             # 记下「这次预读是哪一代开始的」。往后每一次收结果都要核这个数 ——
             # 中途只要又点了一下（invalidate 换代），这份结果就过期了，
             # 绝不能写进缓存。理由见 __init__ 里 `_generation` 那段。
             generation = self._generation
+            before = self._signature
 
         def work():
             delay = self.cfg.click_delay_ms / 1000.0
             retry = self.cfg.click_retry_ms / 1000.0
-            started = time.monotonic()
-
-            def store(snap, read_at):
-                """
-                收下这次读屏的结果。**每次收结果之前都核对代数。**
-
-                换代了（期间用户又点了一下）就把这份丢掉并说明白 ——
-                它反映的是点击前那一屏，写回缓存会让下一次按键拿着过期坐标
-                去点。收下了返回 True，作废了返回 False。
-
-                `source="预读"` 让这一屏同时播给界面和控制台：用户点完之后
-                的几秒里界面显示的就是这一屏，不用按键去「催」它（见 __init__
-                里 `_on_screen` 那段）。
-                """
-                if self.note_if_current(snap, generation, read_at=read_at,
-                                        source="预读"):
-                    return True
-                self.log("       [预读] 期间又点了一下，这次预读作废"
-                         "（结果反映的是点击前那一屏，不收）")
-                return False
-
+            gen = generation
+            sig = before
             try:
-                time.sleep(delay)
-                read_start = time.monotonic()
-                try:
-                    snap = screen.read_screen(self.adb.dump_ui())
-                except Exception as exc:  # noqa: BLE001
-                    self.log(f"       [预读] 读屏失败（{type(exc).__name__}），放弃")
-                    return
-                read_ms = (time.monotonic() - read_start) * 1000
-
-                if before is None or self.signature(snap) != before:
-                    if not store(snap, read_start):
+                while True:
+                    invalidated = self._prefetch_round(gen, sig, delay, retry)
+                    with self._lock:
+                        # 该不该再跑一轮，看两件事：这一轮的活**已经作废**
+                        # （期间点过键、换过代），而且期间**有人提了重启**。
+                        # 少一个都不行 —— 没作废说明结果有效、重跑纯属白读；
+                        # 没标记说明没人要求。
+                        if invalidated and self._restart:
+                            self._restart = False
+                            gen = self._generation    # 按当前代数重跑
+                            sig = self._signature     # 按当前指纹重跑
+                            continue
                         return
-                    self.log(f"       [预读] 读到新界面，"
-                             f"距点击 {(time.monotonic() - started) * 1000:.0f} 毫秒"
-                             f"（本次读屏 {read_ms:.0f} 毫秒）")
-                    return
-
-                # 和点击前一样：**先把这一份收下来**，再去读第二次确认。
-                #
-                # 为什么不压着不存（原来是「不存 → 再读」）：连续两次读到同一屏，
-                # 就说明这就是当前屏幕（用户的原话），**所以第一份本来就是有效数据**——
-                # 没有理由压着不给等在这次预读上的按键用。
-                # 按键等在这里时，若还要它陪预读跑完「确认」那一次读（最长约 5 秒），
-                # 就正是用户抱怨的「答题快的时候按键被吞/被拖」。先收下，按键立刻能
-                # 用它走人；第二次读到什么，再覆盖成什么。
-                #
-                # **确认只做这一次，不再有第 3、4 次。** 理由（用户提出、日志支持）：
-                # 连续两次读到同一屏，就说明这就是当前屏幕 —— 继续读不会读到别的，
-                # 只会白耗时间（每次读屏约 2.4 秒），而这段时间用户的按键全被挡住。
-                # 真机日志里有 5 次白读满 4 遍，最长拖了 16.8 秒。
-                if not store(snap, read_start):
-                    # 这一份在收的过程中发现已经换代（期间又点了一下）——
-                    # 按「作废就收工」办：别再往下读第二次了，读回来也一样不作数。
-                    return
-                self.log(f"       [预读] 还是旧界面，先收下这一份，再读一次确认"
-                         f"（距点击 {(time.monotonic() - started) * 1000:.0f} 毫秒）")
-                time.sleep(retry)
-                read_start = time.monotonic()
-                try:
-                    snap = screen.read_screen(self.adb.dump_ui())
-                except Exception as exc:  # noqa: BLE001
-                    self.log(f"       [预读] 第二次读屏失败（{type(exc).__name__}），放弃")
-                    return
-                read_ms = (time.monotonic() - read_start) * 1000
-                elapsed = (time.monotonic() - started) * 1000
-
-                # 第二次无论读到什么，都收下 —— 它反映的就是当下这一屏。
-                # 但收之前同样要核对代数：按键可能已经把第一份抢走、点下去了，
-                # 这时候这一份就是点击前那一屏，必须作废（见上面的 store）。
-                if not store(snap, read_start):
-                    return
-                if self.signature(snap) == before:
-                    self.log(f"       [预读] 两次一样，认定这就是当前屏，收下"
-                             f"（距点击 {elapsed:.0f} 毫秒，本次读屏 {read_ms:.0f} 毫秒）")
-                else:
-                    self.log(f"       [预读] 第二次读到了新界面，收下"
-                             f"（距点击 {elapsed:.0f} 毫秒，本次读屏 {read_ms:.0f} 毫秒）")
             finally:
                 with self._lock:
                     self._busy = False
+                    self._restart = False
 
         threading.Thread(target=work, daemon=True, name="prefetch-after-click").start()
+
+    def _prefetch_round(self, generation, before, delay, retry):
+        """
+        跑**一轮**预读。跟 `trigger_after_click` 拆开，是为了让「连点时重跑」
+        能在**同一个线程里**循环（见那边的 work）；一轮做的还是原来那一轮的事。
+
+        返回 `True` 表示这一轮的活**已经作废**（跑到一半期间又点了一下、
+        `invalidate()` 换过代），`False` 表示正常收工。调用方只看这一个返回值
+        决定要不要按新代数再跑一轮 —— 「读屏失败 / 放弃」也算正常收工
+        （没有可重跑的意义）。
+
+        `before` 是这一轮开始时的界面指纹（用来判断翻页）；重跑时传的是重跑
+        那一刻的指纹（见 work）。
+        """
+        started = time.monotonic()
+
+        def store(snap, read_at):
+            """
+            收下这次读屏的结果。**每次收结果之前都核对代数。**
+
+            换代了（期间用户又点了一下）就把这份丢掉并说明白 ——
+            它反映的是点击前那一屏，写回缓存会让下一次按键拿着过期坐标
+            去点。收下了返回 True，作废了返回 False。
+
+            `source="预读"` 让这一屏同时播给界面和控制台：用户点完之后
+            的几秒里界面显示的就是这一屏，不用按键去「催」它（见 __init__
+            里 `_on_screen` 那段）。
+            """
+            if self.note_if_current(snap, generation, read_at=read_at,
+                                    source="预读"):
+                return True
+            self.log("       [预读] 期间又点了一下，这次预读作废"
+                     "（结果反映的是点击前那一屏，不收）")
+            return False
+
+        time.sleep(delay)
+        read_start = time.monotonic()
+        try:
+            snap = screen.read_screen(self.adb.dump_ui())
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"       [预读] 读屏失败（{type(exc).__name__}），放弃")
+            return False
+        read_ms = (time.monotonic() - read_start) * 1000
+
+        if before is None or self.signature(snap) != before:
+            if not store(snap, read_start):
+                return True
+            self.log(f"       [预读] 读到新界面，"
+                     f"距点击 {(time.monotonic() - started) * 1000:.0f} 毫秒"
+                     f"（本次读屏 {read_ms:.0f} 毫秒）")
+            return False
+
+        # 和点击前一样：**先把这一份收下来**，再去读第二次确认。
+        #
+        # 为什么不压着不存（原来是「不存 → 再读」）：连续两次读到同一屏，
+        # 就说明这就是当前屏幕（用户的原话），**所以第一份本来就是有效数据**——
+        # 没有理由压着不给等在这次预读上的按键用。
+        # 按键等在这里时，若还要它陪预读跑完「确认」那一次读（最长约 5 秒），
+        # 就正是用户抱怨的「答题快的时候按键被吞/被拖」。先收下，按键立刻能
+        # 用它走人；第二次读到什么，再覆盖成什么。
+        #
+        # **确认只做这一次，不再有第 3、4 次。** 理由（用户提出、日志支持）：
+        # 连续两次读到同一屏，就说明这就是当前屏幕 —— 继续读不会读到别的，
+        # 只会白耗时间（每次读屏约 2.4 秒），而这段时间用户的按键全被挡住。
+        # 真机日志里有 5 次白读满 4 遍，最长拖了 16.8 秒。
+        if not store(snap, read_start):
+            # 这一份在收的过程中发现已经换代（期间又点了一下）——
+            # 别再往下读第二次了：读回来也一样不作数，交给调用方去看有没有
+            # 重启请求、要不要按新代数重跑（见 work）。
+            return True
+        self.log(f"       [预读] 还是旧界面，先收下这一份，再读一次确认"
+                 f"（距点击 {(time.monotonic() - started) * 1000:.0f} 毫秒）")
+        time.sleep(retry)
+        read_start = time.monotonic()
+        try:
+            snap = screen.read_screen(self.adb.dump_ui())
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"       [预读] 第二次读屏失败（{type(exc).__name__}），放弃")
+            return False
+        read_ms = (time.monotonic() - read_start) * 1000
+        elapsed = (time.monotonic() - started) * 1000
+
+        # 第二次无论读到什么，都收下 —— 它反映的就是当下这一屏。
+        # 但收之前同样要核对代数：按键可能已经把第一份抢走、点下去了，
+        # 这时候这一份就是点击前那一屏，必须作废（见上面的 store）。
+        if not store(snap, read_start):
+            return True
+        if self.signature(snap) == before:
+            self.log(f"       [预读] 两次一样，认定这就是当前屏，收下"
+                     f"（距点击 {elapsed:.0f} 毫秒，本次读屏 {read_ms:.0f} 毫秒）")
+        else:
+            self.log(f"       [预读] 第二次读到了新界面，收下"
+                     f"（距点击 {elapsed:.0f} 毫秒，本次读屏 {read_ms:.0f} 毫秒）")
+        return False
 
 
 # ---------------------------------------------------------------- 动作队列接线
@@ -1173,7 +1235,11 @@ def handle_speech(text, logprob, ctx):
         report_unusable_screen(snap)
         return
 
-    show_screen(snap)
+    # **屏幕不在这里打第二遍了。** 这一屏早就打过了 —— 它是程序「刚知道」它的
+    # 那一刻打出来的（预读读完 / 当场读屏时由 `note()` 播报，见 make_screen_publisher）。
+    # 用户点名问过：「之前展示了预读的，为什么我点击后又要展示一次预读，这样不是
+    # 浪费？」所以同一屏只打一次。下面那行留着 —— 它说的是**这一次用的是哪一份、
+    # 多旧**，不是重复屏幕内容。
     say(f"       （界面来源：{source}）")
 
     result = matcher.match(text, snap.options, ctx["cfg"].match,
@@ -1258,7 +1324,10 @@ def handle_numpad(number, ctx):
         say(f"         屏幕上是这些选项：{' / '.join(snap.option_texts())}")
         return
 
-    show_screen(snap)
+    # **屏幕不在这里打第二遍了**（跟 handle_speech 同理）。这一屏是程序「刚知道」
+    # 它的那一刻由 `note()` 播报打出来的（预读读完 / 当场读屏）；这里再用
+    # show_screen 打一遍，就是用户看见的「点击后又展示一次预读」。
+    # 下面那行留着 —— 它说的是**这一次用的是哪一份、多旧**。
     say(f"       （界面来源：{source}）")
     do_click(snap.options[index - 1], ctx, f"小键盘第 {index} 个", key=("numpad", index))
 

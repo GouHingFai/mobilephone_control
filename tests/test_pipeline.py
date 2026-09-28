@@ -1978,6 +1978,86 @@ class TestScreenPublisher(unittest.TestCase):
         self.assertIn("当场读屏", out)
 
 
+class TestSameScreenIsPrintedOnlyOnce(unittest.TestCase):
+    """
+    **本轮缺陷二的证据**（用户实测原话）：
+
+        「之前展示了预读的，为什么我点击后又要展示一次预读，这样不是浪费？」
+
+    预读在后台读到新屏时会**播报**一次（来源 + 题干 + 选项，见
+    `make_screen_publisher`）；而用户按键/说话时 `handle_numpad` / `handle_speech`
+    又调了一次 `show_screen(snap)`，把**同一屏**再打一遍。控制台上于是同一屏
+    出现两回 —— 用户看到的就是「又展示了一次预读」。
+
+    要的行为：**每一屏只打一次**，打在「程序刚知道它」的那一刻（也就是播报那一次）。
+    动作路径上那两句重复的 `show_screen` 已去掉；「（界面来源：预读，x 秒前读好的）」
+    那行留着 —— 它说的是这一次用的是哪一份、多旧，不是重复屏幕内容。
+
+    两条用例走**真接线**（真 ScreenPrefetcher + make_screen_publisher），
+    把整段控制台输出收下来，数一数那一屏的题干到底出现了几次。
+
+    改坏看红：把对应那句 `show_screen(snap)` 加回去，计数变 2。
+    """
+
+    def _run_prefetch_then(self, prefetch_xml, seed_xml, act):
+        """
+        走一遍「预读读到新屏 → 播报 → 执行 act(ctx, fake)」，返回
+        `(那一屏的题干, 收下来的控制台输出, 假 adb)`。
+
+        **用 `mock.patch("builtins.print")` 而不是替换 `app.say`**：
+        `make_screen_publisher` 和 `show_screen` 的 `log=say` 是**函数定义时**
+        就绑好的默认参数，事后替换 `app.say` 拦不到它们 —— 而那正是预读播报
+        那条线，非拦不可（拦不到就数了个寂寞）。所有输出都经 `say()` → `print()`，
+        拦 `print` 一处就全收齐。
+        """
+        ctx, fake, prefetcher = make_prefetch_ctx(
+            prefetch_xml, ui=UiState(), click_delay_ms=1, click_retry_ms=1)
+        ctx["cfg"].click.settle_ms = 0
+        ctx["cfg"].click.debounce_ms = 0
+
+        expected = screen.read_screen(prefetch_xml).prompt
+        printed = []
+        with mock.patch("builtins.print",
+                        side_effect=lambda *a, **k: printed.append(
+                            " ".join(str(x) for x in a))):
+            # 程序手里现在是**另一屏** —— 预读读回来的才算「新屏」，才会播报
+            prefetcher.note(screen.read_screen(seed_xml), source="启动时读到的")
+            prefetcher.trigger_after_click()
+            self.assertTrue(
+                wait_for(lambda: any(f"题干：{expected}" in line for line in printed)),
+                f"先确认预读真的把新屏播报了（要找 {expected!r}）：\n"
+                + "\n".join(printed))
+            # 别让 act 里那次点击再起一个后台预读来搅乱这段输出
+            ctx["cfg"].prefetch.after_click = False
+            act(ctx, fake)
+        return expected, "\n".join(printed), fake
+
+    def test_prefetched_screen_is_printed_once_when_used_by_numpad(self):
+        def press(ctx, fake):
+            app.handle_numpad(1, ctx)
+
+        expected, out, fake = self._run_prefetch_then(SECOND_XML, GRE_XML, press)
+
+        self.assertEqual(len(fake.taps), 1, "先确认这一下真的点了（用的是预读那一屏）")
+        self.assertIn("（界面来源：预读", out,
+                      "那行「这一下用的是哪一份、多旧」要留着")
+        self.assertEqual(
+            out.count(f"题干：{expected}"), 1,
+            "同一屏的题干只该打一次（播报那一次），按键时不许再打一遍：\n" + out)
+
+    def test_prefetched_screen_is_printed_once_when_used_by_speech(self):
+        def say_it(ctx, fake):
+            app.handle_speech("清晰", -0.4, ctx)
+
+        expected, out, fake = self._run_prefetch_then(GRE_XML, SECOND_XML, say_it)
+
+        self.assertEqual(len(fake.taps), 1, "先确认这一下真的点了（用的是预读那一屏）")
+        self.assertIn("（界面来源：预读", out)
+        self.assertEqual(
+            out.count(f"题干：{expected}"), 1,
+            "语音那条路同样：同一屏只打一次：\n" + out)
+
+
 class TestNoteInput(unittest.TestCase):
 
     def test_records(self):
