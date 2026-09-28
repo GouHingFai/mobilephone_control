@@ -170,9 +170,9 @@ class ScreenPrefetcher:
         self._last_seen_at = 0.0
         self._busy = False
         # 「重启请求」：已经有一次预读在跑时，又来了一次点击 —— **不丢掉这次请求**，
-        # 只把这里置上。正在跑的那次预读一旦发现自己这代的活已经作废（期间点过键、
-        # invalidate 换过代），就会看到这个标记，在**同一个线程里**按当前代数与当前
-        # 指纹重跑一遍（见 trigger_after_click 的 work）。
+        # 只把这里置上。正在跑的那次预读**一收工就**看这个标记（不管这一轮是成功、
+        # 失败还是被作废），置着就按当前代数与当前指纹在**同一个线程里**重跑一遍
+        # （见 trigger_after_click 的 work）。
         #
         # 为什么不干脆为每次点击另起一个线程：两个 `uiautomator dump` 同时对同一台
         # 手机下命令，实测把单次读屏从 2.4 秒拖到 8.5 秒（见 take_or_wait 的注释）。
@@ -458,7 +458,8 @@ class ScreenPrefetcher:
 
         两下过去，**一次预读都不剩**：缓存空、也没人在读 —— 用户看到的就是
         「读屏内容变成之前的了」。现在改成置一个「重启请求」（`_restart`）：
-        正在跑的那次一发现自己作废，就在**同一个线程里**按当前代数与当前指纹
+        正在跑的那次一收工就兑现它（**不管这一轮是成功、失败还是被作废**，
+        判断条件与理由见 work 里那段），在**同一个线程里**按当前代数与当前指纹
         重跑一遍。为什么不能为每次点击另起线程（两个 dump 同时下命令会把单次
         读屏从 2.4 秒拖到 8.5 秒），见 __init__ 里 `_restart` 那段。
         """
@@ -487,17 +488,38 @@ class ScreenPrefetcher:
             sig = before
             try:
                 while True:
-                    invalidated = self._prefetch_round(gen, sig, delay, retry)
+                    self._prefetch_round(gen, sig, delay, retry)
                     with self._lock:
-                        # 该不该再跑一轮，看两件事：这一轮的活**已经作废**
-                        # （期间点过键、换过代），而且期间**有人提了重启**。
-                        # 少一个都不行 —— 没作废说明结果有效、重跑纯属白读；
-                        # 没标记说明没人要求。
-                        if invalidated and self._restart:
+                        # 「重启请求」要兑现的条件：**有人提了请求**，而且
+                        # **当前代数已经不是这一轮开始时那一代**了。
+                        #
+                        # 看的是「代数变没变」，**不是**这一轮自己有没有报「被作废」——
+                        # 那正是上一版漏掉的两种情形：
+                        #   - 结果**已经成功存下**之后才来的点击：这一轮没被作废
+                        #     （`_prefetch_round` 返回 False），可缓存已经被
+                        #     `invalidate()` 清掉、活确实白干了，得按新一代重读；
+                        #   - 读屏**失败**（抛异常返回）之后来的点击：同样没被作废。
+                        # 两次的症状一样：缓存空、也没人在读，用户看到的又是
+                        # 「读屏内容变成之前的了」。
+                        #
+                        # 为什么还要看代数，而不是「标记置着就一律重跑」：
+                        # `trigger_after_click()` 也可能在**没有换代**时被调到
+                        # （生产代码里它总跟在 `invalidate()` 后面，只有测试会单挑出来调）。
+                        # 那种请求要的活正是这一轮已经做完的，再读一遍白耗一次读屏
+                        # （约 2.4 秒），期间用户的按键都用不上新屏。
+                        # `test_does_not_run_twice_concurrently` 钉的就是这一条。
+                        if self._restart and self._generation != gen:
                             self._restart = False
                             gen = self._generation    # 按当前代数重跑
                             sig = self._signature     # 按当前指纹重跑
                             continue
+                        # 收工：**释放 `_busy` 与这次检查必须在同一把锁里**
+                        # （`finally` 里那次是兜底）。分两处做的话，「查完 → 还没释放
+                        # → 点击来了」这个缝里，`trigger_after_click()` 会看到
+                        # `_busy` 还立着、把请求记成重启标记，而这边已经决定收工 ——
+                        # 又丢一次，就是刚补掉的那类缝。
+                        self._busy = False
+                        self._restart = False
                         return
             finally:
                 with self._lock:
@@ -512,9 +534,10 @@ class ScreenPrefetcher:
         能在**同一个线程里**循环（见那边的 work）；一轮做的还是原来那一轮的事。
 
         返回 `True` 表示这一轮的活**已经作废**（跑到一半期间又点了一下、
-        `invalidate()` 换过代），`False` 表示正常收工。调用方只看这一个返回值
-        决定要不要按新代数再跑一轮 —— 「读屏失败 / 放弃」也算正常收工
-        （没有可重跑的意义）。
+        `invalidate()` 换过代），`False` 表示正常收工。**这个返回值只作日志与
+        排查用** —— 调用方不再拿它决定要不要重跑（见 work 里那段：只看
+        `_restart` 与代数变没变，因为「存下结果之后」和「读屏失败之后」
+        这两种情形同样需要兑现请求，而它们都返回 `False`）。
 
         `before` 是这一轮开始时的界面指纹（用来判断翻页）；重跑时传的是重跑
         那一刻的指纹（见 work）。
@@ -1442,7 +1465,14 @@ def handle_force_read(ctx):
         report_unusable_screen(snap)
         return
 
-    show_screen(snap)
+    # **屏幕不在这里打第二遍了**（跟 handle_numpad / handle_speech 同理）。
+    # 上面那行 `note(source="强制读屏")` 已经把这一屏播出去了（界面 + 控制台），
+    # 再用 show_screen 打一遍就是同一屏出现两回 —— 用户看到的正是
+    # 「之前展示了一次，为什么又要展示一次」。下面那行留着：它说的是这次读屏
+    # 花了多久、拿到多少字节，不是重复屏幕内容。
+    #
+    # 出错那条路（`report_unusable_screen` 里的 show_screen）**保留** ——
+    # 那时用户正要看清屏上有什么，多说一遍不算吵。
     say(f"       （强制读屏 {read_ms:.0f} 毫秒（{len(xml) // 1024} KB））")
 
 

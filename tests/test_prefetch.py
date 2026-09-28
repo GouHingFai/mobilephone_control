@@ -30,6 +30,31 @@ FIRST_XML = (FIXTURES / "gre_degrade.xml").read_text(encoding="utf-8")
 SECOND_XML = (FIXTURES / "gre_prototype.xml").read_text(encoding="utf-8")
 
 
+def make_quiz_xml(prompt, options=("adj. 狂怒的", "n. 原型，样品")):
+    """
+    现造一屏答题界面 —— 要**第三屏**（跟 FIRST_XML / SECOND_XML 都不同）时用。
+
+    连点那几条用例得能分辨「这一份是哪一轮读回来的」，两份 fixture 不够用：
+    第一轮读回 SECOND、重跑那一轮读回第三屏，缓存里是哪一屏一眼可辨，
+    才证明得了「重启请求真的被兑现了」。
+    """
+    parts = [f'<node text="{prompt}" '
+             f'resource-id="com.enhance.greapp:id/tv_word" '
+             f'package="com.enhance.greapp" bounds="[50,435][1162,623]"/>']
+    for i, option in enumerate(options):
+        top = 736 + i * 188
+        parts.append(
+            f'<node text="{option}" '
+            f'resource-id="com.enhance.greapp:id/tv_question" '
+            f'package="com.enhance.greapp" clickable="true" '
+            f'bounds="[0,{top}][1212,{top + 150}]"/>')
+    return ('<?xml version="1.0" encoding="utf-8"?><hierarchy rotation="0">'
+            + "".join(parts) + "</hierarchy>")
+
+
+THIRD_XML = make_quiz_xml("frenzy")
+
+
 class SequenceAdb:
     """按顺序返回不同的界面 —— 用来模拟「翻页」"""
 
@@ -83,12 +108,8 @@ class BlockingAdb:
                 self._in_dump -= 1
 
 
-def make_prefetcher(*xmls, on_screen=None, **overrides):
-    """造一个用极小延时的预读器，让测试跑得快
-
-    `on_screen` 是「把新读到的一屏播出去」的回调（见 ScreenPrefetcher.__init__）。
-    不传 = 老行为（只存不播）。
-    """
+def make_cfg(**overrides):
+    """造一份只开着「点击后预读」的配置，延时刻意调到最小，让测试跑得快"""
     cfg = Config()
     params = dict(
         after_click=True,
@@ -99,7 +120,16 @@ def make_prefetcher(*xmls, on_screen=None, **overrides):
     )
     params.update(overrides)
     cfg.prefetch = PrefetchConfig(**params)
+    return cfg
 
+
+def make_prefetcher(*xmls, on_screen=None, **overrides):
+    """造一个用极小延时的预读器，让测试跑得快
+
+    `on_screen` 是「把新读到的一屏播出去」的回调（见 ScreenPrefetcher.__init__）。
+    不传 = 老行为（只存不播）。
+    """
+    cfg = make_cfg(**overrides)
     logs = []
     adb = SequenceAdb(*xmls) if xmls else SequenceAdb(FIRST_XML)
     prefetcher = app.ScreenPrefetcher(adb, cfg, log=logs.append, on_screen=on_screen)
@@ -562,17 +592,7 @@ def make_blocking_prefetcher(*xmls, on_screen=None, **overrides):
     `on_screen` 见 `make_prefetcher`；不传 = 老行为（只存不播）。
     返回 `(预读器, adb, 日志)`。
     """
-    cfg = Config()
-    params = dict(
-        after_click=True,
-        click_delay_ms=1,
-        click_retry_ms=1,
-        cache_max_age=8.0,
-        on_speech=False,
-    )
-    params.update(overrides)
-    cfg.prefetch = PrefetchConfig(**params)
-
+    cfg = make_cfg(**overrides)
     logs = []
     adb = BlockingAdb(*xmls)
     prefetcher = app.ScreenPrefetcher(adb, cfg, log=logs.append, on_screen=on_screen)
@@ -670,6 +690,128 @@ class TestDoubleClickDoesNotDropThePrefetch(unittest.TestCase):
         self.assertEqual(cached[0].prompt, "prototype",
                          "兑现的就是「第二下之后读到的那一屏」")
         self.assertFalse(prefetcher._restart, "兑现之后标记要清掉，免得影响下一轮")
+
+
+class FailsOnceAdb:
+    """
+    第一次 `dump_ui()` **抛异常**；抛之前先把「点击」做掉（如果给了回调）。
+
+    用它钉死缝二的时序：读屏正失败着，用户在那一刻点了一下。旧写法里这一轮
+    既没被作废（异常那条路返回 False）、也没人看 `_restart`，请求就这么没了。
+    """
+
+    def __init__(self, xml, on_first_call=None):
+        self.xml = xml
+        self.calls = 0
+        self.on_first_call = on_first_call
+
+    def dump_ui(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            if self.on_first_call is not None:
+                self.on_first_call()
+            raise RuntimeError("假装读屏失败")
+        return self.xml
+
+
+class ClickRightAfterStoringPrefetcher(app.ScreenPrefetcher):
+    """
+    在「第一次成功存下结果」之后、这一轮还没收工时，触发一次**点击**
+    （invalidate + trigger_after_click）。
+
+    缝一就卡在这一瞬：结果已经存下，所以这一轮**没有被作废**
+    （`_prefetch_round` 返回 False），而重启请求确实来了 ——
+    「只在发现自己作废时才看 `_restart`」的写法会把它丢掉。
+
+    做法是把 `note_if_current` 包一层：先调父类（它自己拿锁、存、放锁），
+    存下了再动手 —— 于是既落在「存下之后」，也不会去碰那把不可重入的锁。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.after_store = None
+        self.fired = False
+
+    def note_if_current(self, snap, generation, read_at=None, source=""):
+        stored = super().note_if_current(snap, generation, read_at=read_at,
+                                         source=source)
+        if stored and not self.fired:
+            self.fired = True
+            self.after_store()
+        return stored
+
+
+class TestRestartIsHonouredHoweverTheRoundEnds(unittest.TestCase):
+    """
+    **缝一、缝二**（上一轮修复留下的缝，实现者自己报的）。
+
+    上一轮把「`_busy` 时来的第二次请求」从「丢掉」改成「记一个 `_restart` 标记」，
+    但**兑现的条件**写成了「这一轮被作废 **且** 标记置着」。于是有两种情形照丢：
+
+      缝一：结果**已经成功存下** → 这一轮没被作废 → 收工前来的那次点击被无视。
+            （用户那一刻看到的是：缓存刚被 invalidate 清掉，新的一屏却没人去读。）
+      缝二：这一轮**读屏失败**（抛异常返回）→ 也没被作废 → 同样被无视。
+
+    要的行为：**每一轮收工时都看一眼 `_restart`**，不问这一轮是成功、失败还是
+    被作废 —— 置着就按当前代数与当前指纹再跑一轮。检查与释放 `_busy` 必须在
+    同一把锁里（否则又是「查完、还没放、点击来了」的缝）。
+
+    两条用例都用假 adb 把「点击发生在哪一瞬」钉死，不靠 sleep 碰运气。
+
+    改坏看红：把 work() 里的收工检查改回「作废了才看 `_restart`」，
+    两条都红（缓存是空的 —— 被 invalidate 清了、又没人去读新的）。
+    """
+
+    def test_a_click_between_storing_and_finishing_still_gets_a_round(self):
+        """**缝一**：结果已存下、收工前来了一次点击 —— 那次请求必须被兑现"""
+        # call1 = 第一轮读到新屏（SECOND），存下之后立刻「点击」
+        # call2 = 重跑那一轮读到的新屏（THIRD）
+        cfg = make_cfg()
+        logs = []
+        adb = SequenceAdb(SECOND_XML, THIRD_XML)
+        prefetcher = ClickRightAfterStoringPrefetcher(adb, cfg, log=logs.append)
+
+        prefetcher.note(screen.read_screen(FIRST_XML))   # 点击前那一屏
+        prefetcher.invalidate()                          # 第一下
+        prefetcher.after_store = lambda: (
+            prefetcher.invalidate(),                     # 第二下：换代
+            prefetcher.trigger_after_click(),            # 第二下：请求预读
+        )
+        prefetcher.trigger_after_click()                 # 第一下：启动预读
+        self.assertTrue(wait_idle(prefetcher))
+
+        cached = prefetcher.take()
+        self.assertIsNotNone(
+            cached,
+            "存下结果之后来的那次点击不能被丢掉 —— 旧写法这里是空的："
+            "这一轮没被作废，标记就被无视了，而缓存刚被 invalidate 清掉")
+        self.assertEqual(cached[0].prompt, "frenzy",
+                         "缓存的必须是**那次点击之后**重新读到的那一屏")
+        self.assertEqual(adb.calls, 2, "第一轮一次读 + 按新代数重跑一次读")
+        self.assertFalse(prefetcher._restart, "兑现之后标记要清掉")
+
+    def test_a_click_around_a_failed_read_still_gets_a_round(self):
+        """**缝二**：第一次读屏抛异常、期间来了点击 —— 那次请求必须被兑现"""
+        cfg = make_cfg()
+        logs = []
+        adb = FailsOnceAdb(THIRD_XML)
+        prefetcher = app.ScreenPrefetcher(adb, cfg, log=logs.append)
+        adb.on_first_call = lambda: (
+            prefetcher.invalidate(),
+            prefetcher.trigger_after_click(),
+        )
+
+        prefetcher.trigger_after_click()
+        self.assertTrue(wait_idle(prefetcher))
+
+        cached = prefetcher.take()
+        self.assertIsNotNone(
+            cached, "读屏失败那一次之后来的点击不能被丢掉（会再跑一轮并成功）")
+        self.assertEqual(cached[0].prompt, "frenzy",
+                         "重跑那一轮读到的就是当前这一屏")
+        self.assertEqual(adb.calls, 2, "第一次失败 + 重跑一次成功")
+        self.assertTrue(any("读屏失败" in line for line in logs),
+                        "第一次失败要在日志里说明白")
 
 
 class RecordingOnScreen:

@@ -79,7 +79,11 @@ BASELINE_COUNTS = {
     #   按键那条路（handle_numpad）与语音那条路（handle_speech）各一条。
     #   两条都走**真接线**（真 ScreenPrefetcher + make_screen_publisher），
     #   把整段控制台输出收下来数一数；把 show_screen 加回去计数就变 2。
-    "tests.test_pipeline": 130,
+    # 2026-09-28（r2 任务 10）：130 → 131 —— 同一类「重复打屏」还剩一处没清：
+    #   `handle_force_read`（小键盘 . 强制读屏）也是 `note(source="强制读屏")`
+    #   播报一次、调用方紧接着又 `show_screen(snap)` 打一次。在同一个类里加
+    #   一条 `test_force_read_prints_the_screen_once`（把重复那句加回去就红）。
+    "tests.test_pipeline": 131,
     # 26 → 27：预读改成「最多读两次」（见 test_prefetch.py）。原有的
     # 「试满次数再放弃」改写成「一直没变也收下」（1 条），另加「读到新界面只读一次」（1 条），
     # 共 +1。
@@ -109,7 +113,16 @@ BASELINE_COUNTS = {
     #    dump 在跑」（**主证据**，用 BlockingAdb 把「卡在第二次读上」这一刻钉死）
     #   「第二次 trigger_after_click() 要留下重启标记、并且真的兑现，不能静默丢掉」
     # 旧代码下第一条断言「缓存里必须有东西」就红（缓存是空的）。
-    "tests.test_prefetch": 42,
+    # 2026-09-28（r2 任务 10）：42 → 44 —— 上一轮那处修复留了两个缝（实现者自己报的）：
+    #   缝一：结果**已经成功存下**之后才来的点击，那一轮没被作废（`_prefetch_round`
+    #     返回 False），而兑现条件写的是「被作废 **且** 有标记」→ 请求被无视；
+    #   缝二：读屏**失败**（抛异常返回）那一轮同理，请求也被无视。
+    #   加 TestRestartIsHonouredHoweverTheRoundEnds 两条，各钉一个缝：断言重启请求
+    #   被兑现（缓存里是那次点击之后重读到的第三屏），且只多跑一轮。
+    #   两条都靠假 adb 把「点击发生在哪一瞬」钉死（缝一在 `note_if_current` 存下之后
+    #   立刻动手，缝二在第一次 `dump_ui()` 抛异常之前动手），不靠 sleep 碰运气。
+    #   旧代码下两条都红（缓存是空的 —— 被 invalidate 清了、又没人去读新的）。
+    "tests.test_prefetch": 44,
     "tests.test_screen": 27,
     # 7：UiState（线程安全状态黑板）—— 界面与主逻辑唯一的交汇点
     "tests.test_ui_state": 7,
@@ -194,6 +207,10 @@ REQUIRED_CLASSES = {
         # 整类删掉时用例数会掉到基线以下，但**改成等量的无关测试**就发现不了，
         # 所以按名字钉住。
         "TestBroadcastScreen",             # 存下一份新屏就播；同一屏不播两遍
+        # 2026-09-28（r2 任务 10）：连点那两次修复的**缝**（成功存下之后来的点击、
+        # 读屏失败之后来的点击，两处都会把请求丢掉）。删掉这个类，这两个缝就
+        # 再没有用例拦得住了 —— 而用户看到的是同一个老症状「读屏内容变成之前的了」。
+        "TestRestartIsHonouredHoweverTheRoundEnds",   # 每轮收工前都兑现重启请求
     ],
     "tests.test_voice_gate": [
         "TestSuppress",                    # 静音期

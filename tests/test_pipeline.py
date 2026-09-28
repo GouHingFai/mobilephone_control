@@ -2058,6 +2058,41 @@ class TestSameScreenIsPrintedOnlyOnce(unittest.TestCase):
             "语音那条路同样：同一屏只打一次：\n" + out)
 
 
+    def test_force_read_prints_the_screen_once(self):
+        """
+        「.」强制读屏（`handle_force_read`）也只打一次屏。
+
+        跟上面两条是同一类毛病：`note(source="强制读屏")` 已经把这一屏播出去了
+        （界面 + 控制台那几行），调用方紧接着又 `show_screen(snap)` 打一遍 ——
+        控制台上同一屏出现两回。重复的那一句去掉；「（强制读屏 N 毫秒（M KB））」
+        那行**留着**，它说的是这次读屏花了多久，不是重复屏幕内容。
+
+        出错那条路（`report_unusable_screen` 里的 `show_screen`）**保留** ——
+        那时用户正要看清屏上有什么，多说一遍不算吵。
+
+        改坏看红：把 `handle_force_read` 里那句 `show_screen(snap)` 加回去，
+        题干计数变 2。
+        """
+        ctx, fake, _prefetcher = make_prefetch_ctx(GRE_XML, ui=UiState())
+        expected = screen.read_screen(GRE_XML).prompt
+
+        printed = []
+        with mock.patch("builtins.print",
+                        side_effect=lambda *a, **k: printed.append(
+                            " ".join(str(x) for x in a))):
+            app.handle_force_read(ctx)
+
+        out = "\n".join(printed)
+        self.assertEqual(fake.dump_calls, 1, "先确认真的当场读了一次")
+        self.assertEqual(
+            out.count(f"题干：{expected}"), 1,
+            "同一屏的题干只该打一次（播报那一次），强制读屏不许再打一遍：\n" + out)
+        self.assertIn("强制读屏", out, "来源信息要留着")
+        self.assertRegex(
+            out, r"（强制读屏 \d+ 毫秒（\d+ KB））",
+            "「这一下花了多久」那行要留着：\n" + out)
+
+
 class TestNoteInput(unittest.TestCase):
 
     def test_records(self):
