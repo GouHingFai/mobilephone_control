@@ -1573,13 +1573,33 @@ def main(argv=None):
 
     # --- 监视界面
     section("准备界面读取")
+    # --- 界面（可选）
+    # 开不开：命令行 --gui，或者 config.yaml 里 gui.enabled，二者取或。
+    #
+    # 这里先尽早试一次 import：Tkinter 没装是最常见的失败，import 时就抛出来了。
+    # 但**import 成功不等于界面能起来** —— 没有显示器、Tk 初始化失败，都要等真正
+    # 开窗那一刻才知道。所以真正兜底的是下面主循环那**一整段**：无论哪种失败，
+    # 都打一句提示然后退回纯命令行继续跑（设计文档 §6），绝不把程序拦在门外。
+    # 换句话说，不带 --gui 时这两处一行都不会执行，行为与从前完全一致。
+    #
+    # **界面对象必须建在预读器之前**：启动时读到的那一屏也会走「播出去」那条线，
+    # 建晚了它就只进得了控制台、进不了界面 —— 结果是开窗后面板一片空白，
+    # 得等你按下第一下才填上。
+    use_gui = args.gui or cfg.gui.enabled
+    gui = None
+    if use_gui:
+        try:
+            from . import gui
+        except Exception as exc:  # noqa: BLE001
+            say(f"  [注意] 界面打不开（{type(exc).__name__}: {exc}），"
+                f"退回纯命令行模式继续跑")
+            use_gui = False
+    ctx["ui"] = UiState() if use_gui else None
+
     # 预读器要先建好：下面读到的这一屏要顺手存进它的缓存，
     # 否则启动后的第一次操作会因为没有缓存而当场读屏（白等约 2.4 秒）。
     #
     # `on_screen` 是「存下一份新屏就播给界面和控制台」那条线（见 make_screen_publisher）。
-    # 挂在这里 —— 界面对象（ctx["ui"]）要到下面才建，但回调是闭包、调用时才取
-    # ctx["ui"]，所以不影响。副作用是启动这次播报只有控制台看得到（界面还没建），
-    # 界面要等第一次点击（或强制读屏）之后才有内容。
     ctx["prefetcher"] = ScreenPrefetcher(adb, cfg, log=say,
                                          on_screen=make_screen_publisher(ctx))
     startup_snap = probe_startup_screen(adb, ctx["prefetcher"], log=say)
@@ -1594,25 +1614,6 @@ def main(argv=None):
     ctx["mode"] = mode
     ctx["clicker"] = Clicker(adb, cfg.click, log=say, debug_dir=debug_dir)
     ctx["voice_gate"] = VoiceGate(cfg.voice, log=say)
-
-    # --- 界面（可选）
-    # 开不开：命令行 --gui，或者 config.yaml 里 gui.enabled，二者取或。
-    #
-    # 这里先尽早试一次 import：Tkinter 没装是最常见的失败，import 时就抛出来了。
-    # 但**import 成功不等于界面能起来** —— 没有显示器、Tk 初始化失败，都要等真正
-    # 开窗那一刻才知道。所以真正兜底的是下面主循环那**一整段**：无论哪种失败，
-    # 都打一句提示然后退回纯命令行继续跑（设计文档 §6），绝不把程序拦在门外。
-    # 换句话说，不带 --gui 时这两处一行都不会执行，行为与从前完全一致。
-    use_gui = args.gui or cfg.gui.enabled
-    gui = None
-    if use_gui:
-        try:
-            from . import gui
-        except Exception as exc:  # noqa: BLE001
-            say(f"  [注意] 界面打不开（{type(exc).__name__}: {exc}），"
-                f"退回纯命令行模式继续跑")
-            use_gui = False
-    ctx["ui"] = UiState() if use_gui else None
 
     # --- 热键
     section("准备热键")
