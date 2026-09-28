@@ -14,6 +14,7 @@ test_pipeline.py —— 端到端链路测试
 
 import re
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -131,7 +132,7 @@ class FakeAdb:
 class StubPrefetcher:
     """不做预读，永远返回 None，逼主流程走当场读屏"""
 
-    def __init__(self):
+    def __init__(self, on_screen=None):
         self.invalidated = 0
         self.after_click_triggers = 0
         self.on_speech_triggers = 0
@@ -140,6 +141,12 @@ class StubPrefetcher:
         self.peeked = None      # 测试可以塞一份进去，模拟「最近见过的那一屏」
         self.peeked_age = 0.0   # 上面那一屏是多少秒前读到的（日志里要打出来）
         self._miss = "还没有预读结果"
+        # 「把新读到的一屏播出去」的回调（真 ScreenPrefetcher 的 on_screen）。
+        # 桩必须跟着生产代码的语义走：真预读器改成「存下一份新屏时同时播给界面
+        # 和控制台」之后，桩若还只记个数字，`grab_screen` 那条「当场读屏」的路
+        # 就会在测试里静默丢掉「界面拿得到屏」这层保护 —— 真机上界面一直空着，
+        # 而全套测试照样绿。
+        self.on_screen = on_screen
 
     def take(self):
         # **取用但不删除** —— 跟真的 ScreenPrefetcher 保持一致。
@@ -159,8 +166,14 @@ class StubPrefetcher:
         self.cached = None
         self._miss = "刚点击过，缓存已作废（界面要翻页了）"
 
-    def note(self, snap, read_at=None):
+    def note(self, snap, read_at=None, source=""):
+        """
+        收下一次读屏。**带 source 的才播出去** —— 跟真的 ScreenPrefetcher 同一个约定
+        （见那边 note() 的说明：不传 source = 没人要求播，一声不吭）。
+        """
         self.noted += 1
+        if source and self.on_screen is not None:
+            self.on_screen(snap, source, 0.0)
 
     def peek(self):
         """
@@ -220,6 +233,11 @@ def make_ctx(xml, preview=False, ui=None):
 
     `ui` 默认 None —— **整个 ctx 里就不带 "ui" 这个键**，
     模拟「不带 --gui 启动」。要测界面接线时传一个真的 `UiState()`。
+
+    桩预读器也按 `main()` 的接法挂上「播屏」回调（`make_screen_publisher`）——
+    于是「读到新屏 → 界面看得见」这条线在桩上也成立，`grab_screen` 里那处
+    直接调 `publish_screen` 才能安全去掉（不然同一屏会被播两遍）。
+    回调是闭包，`ctx` 在调用时才取值，所以这里先建 ctx 再挂回调没关系。
     """
     cfg = Config()
     fake = FakeAdb(xml)
@@ -228,13 +246,69 @@ def make_ctx(xml, preview=False, ui=None):
         "cfg": cfg,
         "preview": preview,
         "recognizer": StubRecognizer(),
-        "prefetcher": StubPrefetcher(),
         "voice_gate": StubVoiceGate(),
         "clicker": Clicker(fake, cfg.click, log=lambda *_: None),
     }
     if ui is not None:
         ctx["ui"] = ui
+    ctx["prefetcher"] = StubPrefetcher(on_screen=app.make_screen_publisher(ctx))
     return ctx, fake
+
+
+def make_prefetch_ctx(xml, ui=None, **prefetch_overrides):
+    """
+    跟 `make_ctx` 一样，但用的是**真** `ScreenPrefetcher`（同样按 main() 的接法挂上
+    播屏回调）。要验「预读读完会自己播出来」这条线时必须用它 ——
+    桩的 note() 只会照着我写的规矩走，证明不了生产代码真会调回调。
+
+    返回 `(ctx, fake, prefetcher)`。
+    """
+    cfg = Config()
+    for key, value in prefetch_overrides.items():
+        setattr(cfg.prefetch, key, value)
+    fake = FakeAdb(xml)
+    ctx = {
+        "adb": fake,
+        "cfg": cfg,
+        "preview": False,
+        "recognizer": StubRecognizer(),
+        "voice_gate": StubVoiceGate(),
+        "clicker": Clicker(fake, cfg.click, log=lambda *_: None),
+    }
+    if ui is not None:
+        ctx["ui"] = ui
+    prefetcher = app.ScreenPrefetcher(
+        fake, cfg, log=lambda *_: None, on_screen=app.make_screen_publisher(ctx))
+    ctx["prefetcher"] = prefetcher
+    return ctx, fake, prefetcher
+
+
+def wait_for(predicate, timeout=3.0):
+    """等某个条件成立。轮询，不靠 sleep 撞运气 —— 条件一成立就往下走。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+class CountingUiState(UiState):
+    """
+    数一数界面被写了几次。
+
+    「同一屏别播两遍」这件事只能这么验：`note()` 播一次、调用方又直接
+    `publish_screen` 一次的话，界面结果看起来一模一样，只有次数能说明问题
+    （控制台上就是同一屏白白多打了一遍）。
+    """
+
+    def __init__(self, keep_inputs=8):
+        super().__init__(keep_inputs)
+        self.set_calls = 0
+
+    def set_screen(self, view):
+        self.set_calls += 1
+        super().set_screen(view)
 
 
 class TestHappyPath(unittest.TestCase):
@@ -794,6 +868,26 @@ class TestForceRead(unittest.TestCase):
         app.handle_force_read(ctx)
 
         self.assertEqual(fake.taps, [])
+
+    def test_broadcasts_the_fresh_screen_to_the_ui(self):
+        """
+        强制读屏读到的那一屏要**立刻**出现在界面上，来源标「强制读屏」。
+
+        用**真** `ScreenPrefetcher`（按 main() 的接法挂上 `make_screen_publisher`），
+        因为要验的正是「真预读器的 note() 会把屏播出去」—— 桩证明不了这件事。
+
+        改坏看红：把 note() 里那次回调调用去掉，这一条变红（界面永远是空的）。
+        """
+        ctx, fake, _pref = make_prefetch_ctx(GRE_XML, ui=UiState())
+
+        app.handle_force_read(ctx)
+
+        self.assertEqual(fake.dump_calls, 1, "先确认真的当场读了一次")
+        view = ctx["ui"].current_screen()
+        self.assertIsNotNone(view, "强制读屏之后界面要拿到刚读到的那一屏")
+        self.assertEqual(view.source, "强制读屏")
+        self.assertEqual(view.prompt, "degrade")
+        self.assertEqual([o.text for o in view.options][:1], ["adj. 清晰易懂的"])
 
 
 class TestCachedScreenIsUsed(unittest.TestCase):
@@ -1842,6 +1936,48 @@ class TestPublishScreen(unittest.TestCase):
         app.publish_screen({"ui": None}, screen.read_screen(GRE_XML), "预读")
 
 
+class TestScreenPublisher(unittest.TestCase):
+    """
+    `make_screen_publisher` —— 把「程序手里那一屏」播给界面**和控制台**。
+
+    这是本轮修缺陷时新加的接线（用户实测报告：控制台和界面都不显示预读的内容，
+    只有点击后才显示上一屏，永远慢一拍）。挂到预读器上之后，`note()` 每次存下
+    一份新屏就播一次，于是**预读在后台读好的新题会自己出现在界面和控制台里**。
+
+    控制台那一半是用户点名要的：他得一眼看出「这屏是预读的，不是当前点击用的」。
+    所以除了界面，还得有一行标明来源，加上题干、选项那两行。
+    """
+
+    def test_publishes_to_the_ui_and_prints_the_source(self):
+        ctx = {"ui": UiState()}
+        publisher = app.make_screen_publisher(ctx)
+        snap = screen.read_screen(GRE_XML)
+
+        with mock.patch("builtins.print") as printed:
+            publisher(snap, "预读", 1.5)
+
+        view = ctx["ui"].current_screen()
+        self.assertIsNotNone(view, "界面第二块要拿到这一屏")
+        self.assertEqual(view.source, "预读")
+        self.assertEqual(view.prompt, "degrade")
+        self.assertAlmostEqual(view.age_seconds, 1.5, places=3)
+
+        out = "\n".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        self.assertIn("预读", out, "控制台要有一行标明这屏是怎么来的")
+        self.assertIn("[屏幕] 题干：degrade", out)
+        self.assertIn("[屏幕] 选项：", out)
+
+    def test_works_without_ui(self):
+        """没开界面时，控制台那条路照走（「不带 --gui 只是多打两行」）"""
+        publisher = app.make_screen_publisher({})
+
+        with mock.patch("builtins.print") as printed:
+            publisher(screen.read_screen(GRE_XML), "当场读屏", 0.2)
+
+        out = "\n".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        self.assertIn("当场读屏", out)
+
+
 class TestNoteInput(unittest.TestCase):
 
     def test_records(self):
@@ -1861,10 +1997,14 @@ class TestUiStateWiring(unittest.TestCase):
 
     由来（和 TestActionWiring 是同一类问题，台账里这是第四次栽在它上面）：
     `publish_screen` / `note_input` 两个纯函数本身有测试（见 TestPublishScreen /
-    TestNoteInput），但它们**被调用**的那几处 —— grab_screen 里的两处
-    publish_screen、do_click 里的两处 note_input、handle_numpad 与 handle_speech
-    里各一处 —— 原本零覆盖。把这些调用点**全部删掉**，275 个用例照样全绿，
+    TestNoteInput），但它们**被调用**的那几处 —— grab_screen 里的 publish_screen、
+    do_click 里的两处 note_input、handle_numpad 与 handle_speech 里各一处 ——
+    原本零覆盖。把这些调用点**全部删掉**，275 个用例照样全绿，
     而真机上界面会永远空着（谁把接线接错也没人拦得住）。
+
+    （2026-09-28：当场读屏那一处 `publish_screen` 挪进了 `note()` 的播报里，
+    所以 grab_screen 现在只剩「用缓存」那一档还直接调 publish_screen ——
+    那一档不经过 note()，播报管不到它。两档各有一条用例。）
 
     所以这里钉的不是「纯函数会不会算」，而是「主流程有没有真的把线接上」：
     每一条断言都对应一个具体的调用点，把那一处调用删掉它就必须变红。
@@ -1906,6 +2046,20 @@ class TestUiStateWiring(unittest.TestCase):
         self.assertEqual(view.source, "预读")
         self.assertEqual(len(view.options), 5)
         self.assertEqual(fake.dump_calls, 0, "有预读就不该再读屏（先确认真走了预读那条路）")
+
+    def test_grab_screen_publishes_the_fresh_read_only_once(self):
+        """
+        当场读屏那条路只许往界面写**一次**。
+
+        这一屏原来有两个来源会写：`note()` 播一次（新增的），以及 grab_screen
+        自己紧跟一句 `publish_screen`（老代码）。两处都在的话界面结果看起来一样，
+        只有次数看得出来 —— 而控制台上就是同一屏白白多打了一遍。
+        """
+        ctx, _fake = make_ctx(GRE_XML, ui=CountingUiState())
+
+        app.grab_screen(ctx)
+
+        self.assertEqual(ctx["ui"].set_calls, 1, "同一屏只该播一遍")
 
     # -------------------------------------------- 点击后留下「我的输入」
 
@@ -2033,6 +2187,55 @@ class TestUiStateWiring(unittest.TestCase):
         self.assertIn("没匹配上", events[0].outcome)
         self.assertIn("5 个选项", events[0].outcome,
                       "要说清屏幕上到底有几个选项，别笼统说「没有这个词」")
+
+
+class TestPrefetchedScreenReachesTheUiWithNoExtraKey(unittest.TestCase):
+    """
+    **本轮缺陷的主证据**（用户实测报告）：
+
+        控制台和可视化界面都不会显示预读的内容，只有点击后才显示之前的屏幕读屏，
+        这样完全滞后，没有意义。
+
+    真正的病根不在「读得慢」，而在「读到了却不说」：预读在后台把新题读好之后只调了
+    `note()` 存进缓存（`voice_tap/main.py` 里 `trigger_after_click` 内），**没有播出去**。
+    于是用户点完之后的那几秒（**正是他要用界面核对「读屏读对了没有」的时间**）
+    界面和控制台显示的都还是上一题；等他按下键，界面才跳到当前题 ——
+    而那时他已经点完了。永远慢一拍。
+
+    这条用例走**真接线**：真 `ScreenPrefetcher`（按 main() 的接法挂上
+    `make_screen_publisher`）+ 可控的假 adb。**只按一次键，然后什么都不做**，
+    界面里那一屏就必须自己变成新题 —— 靠的就是预读读完会播出来。
+
+    改坏看红：把 `note()` 里那次回调调用去掉，界面会永远停在点击前那一屏（"degrade"），
+    这条等待超时、变红。
+    """
+
+    def test_one_keypress_is_enough_for_the_new_question_to_show_up(self):
+        ctx, fake, prefetcher = make_prefetch_ctx(
+            SECOND_XML,                                  # 翻页之后读到的是这一屏
+            ui=UiState(),
+            click_delay_ms=1, click_retry_ms=1,          # 测试里别真等 300 毫秒
+        )
+        ctx["cfg"].click.settle_ms = 0
+        # 程序手里现在是第一题（启动时读到的那一屏）
+        prefetcher.note(screen.read_screen(GRE_XML), source="启动时读到的")
+        self.assertEqual(ctx["ui"].current_screen().prompt, "degrade",
+                         "先确认界面上现在确实是第一题")
+
+        app.handle_numpad(1, ctx)                        # 用户按了一次 1
+
+        self.assertEqual(len(fake.taps), 1, "先确认这一下真的点了")
+        # **不用再按键**：预读读完新题会自己播出来
+        self.assertTrue(
+            wait_for(lambda: (ctx["ui"].current_screen() is not None
+                              and ctx["ui"].current_screen().prompt == "prototype")),
+            "预读读到的**新题**应该自己出现在界面上（不用再按键），"
+            f"界面里现在还是 {ctx['ui'].current_screen()!r}")
+        view = ctx["ui"].current_screen()
+        self.assertEqual(view.source, "预读", "来源要如实标成「预读」")
+        self.assertEqual([o.text for o in view.options],
+                         [n.text for n in screen.read_screen(SECOND_XML).options],
+                         "播出来的得是新题的选项，不是上一题的")
 
 
 class TestUiWiringWithoutUi(unittest.TestCase):

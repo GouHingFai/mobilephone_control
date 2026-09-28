@@ -108,6 +108,11 @@ class ScreenPrefetcher:
 
         按数字键 → 用上一次预读好的坐标点 → 点完立刻读下一屏 → 下次直接可用
 
+    **读到什么，就播出去什么**（`on_screen` 回调，见 __init__）：
+    每一次「程序手里那一屏」发生变化，都同时播给界面和控制台。用户要能立刻看到
+    程序现在手里是哪一屏，而不是等下一次点击才补上 —— 否则他点击之后的那几秒
+    （正是要核对「读屏读对了没有」的时间）看到的永远是上一题。
+
     **按数字键时不重新读屏**。用户通过 scrcpy 看着屏幕操作，界面状态他自己清楚，
     不需要程序每次再确认一遍。取界面走这三档（见 grab_screen 的 allow_stale）：
     缓存里有就用缓存；缓存空就用「最近读到的那一屏」（**不等这一份预读读完**）；
@@ -116,15 +121,46 @@ class ScreenPrefetcher:
     如果你自己用鼠标动了界面，按小键盘的「.」强制重新读一次。
     """
 
-    def __init__(self, adb, cfg, log=say):
+    def __init__(self, adb, cfg, log=say, on_screen=None):
         self.adb = adb
         self.cfg = cfg.prefetch
         self.log = log
+        # 「把新读到的一屏播出去」的回调，形如 `on_screen(snap, source, age)`。
+        #
+        # 为什么需要它（用户实测报告的缺陷）：
+        #
+        #     控制台和可视化界面都不会显示预读的内容，只有点击后才显示之前的
+        #     屏幕读屏，这样完全滞后，没有意义。
+        #
+        # 病根是「读到了却不说」—— 界面那一块的数据来自 publish_screen()，
+        # 而 publish_screen 原先只在 grab_screen() 里被调，也就是只在**用户按键/
+        # 说话、程序准备点击的那一刻**才更新。预读在后台把新题读好之后只调 note()
+        # 存进缓存、不播出去，于是用户点完之后的那几秒（**正是他要用界面核对
+        # 「读屏读对了没有」的时间**）显示的都还是上一题；等他按下键，界面才跳到
+        # 当前题 —— 而那时他已经点完了。**永远慢一拍。**
+        #
+        # note() 是「程序对屏幕的认知」唯一的变更点，所以播报挂在它身上：
+        # 每次存下一份新屏，就同时播给界面和控制台。
+        #
+        # 默认 None = 不播（老行为，向后兼容）。真接线见 main() 里的
+        # make_screen_publisher()。
+        self._on_screen = on_screen
         self._lock = threading.Lock()
         self._snapshot = None       # 缓存的界面
         self._at = 0.0              # 它是什么时候读到的
         self._signature = None      # 最近一次见过的界面指纹（用来判断翻页）
         self._last_seen = None      # 最近见过的界面（不消费，给识别当上下文用）
+        # 上一次**播出去**的那一屏的指纹。
+        #
+        # 只有「内容跟上一次播出去的不同」才播：不然「还是旧界面 → 再读一次确认」
+        # 那条路会把同一屏存两次，控制台就把同一屏打两遍，吵。屏幕没变 = 没有
+        # 什么新东西要给用户看，不出声才对。
+        #
+        # 注意它跟 `_signature` 是两件事：`_signature` 每次 store 都更新（翻页检测
+        # 靠它），这个只在**真的播了**之后才更新。invalidate() 两个都不动
+        # （理由见 invalidate 的注释）。
+        self._published_signature = None
+
         # 「最近见过那一屏」是什么时候读到的。
         #
         # 它跟 `_at` 平时是同一个值，但**作废之后就不是了**：invalidate() 把 `_at`
@@ -161,7 +197,7 @@ class ScreenPrefetcher:
 
     # ---------------------------------------------------------- 缓存
 
-    def note(self, snap, read_at=None):
+    def note(self, snap, read_at=None, source=""):
         """
         记下一次读屏的结果：既当缓存，也更新指纹。
 
@@ -169,29 +205,59 @@ class ScreenPrefetcher:
         界面反映的是那一刻（或稍后）的样子。这个区别很关键：
         一次很慢的后台读，返回时调用时刻反而更晚，如果拿调用时刻比较，
         它会覆盖掉中间读到的更新数据。**要按开始读的时刻比，才不会拿旧的盖新的。**
+
+        `source` 是「这一屏是怎么来的」。**填了它才播出去**（界面 + 控制台），
+        而且只在内容跟上一次播出去的不同时才播。不填（默认）= 谁都没要求播，
+        一声不吭 —— 老行为原样保留，桩和别的调用点不必跟着改。
+
+        播报的时机是**存下之后**，而且真正调回调是在**出了锁**之后：回调要去碰
+        界面、要去打印，占着预读器的锁做这些会把 take() 一起堵住，
+        预读线程和按键线程就互相等了。
         """
         read_at = time.monotonic() if read_at is None else read_at
         with self._lock:
-            self._store_locked(snap, read_at)
+            _stored, emit = self._store_locked(snap, read_at, source)
+        if emit:
+            self._emit(snap, source, read_at)
 
-    def _store_locked(self, snap, read_at):
+    def _emit(self, snap, source, read_at):
+        """
+        真正把这一屏播出去。**调用方必须已经出了锁。**
+
+        「调不调回调」是这一处说了算 —— 两条写入路径（note / note_if_current）
+        都汇到这里，所以「把播报去掉」只有一个地方可改，一改两条路一起失效。
+        """
+        self._on_screen(snap, source, time.monotonic() - read_at)
+
+    def _store_locked(self, snap, read_at, source=""):
         """
         真正写缓存与指纹的那一步。**调用方必须已经持有 self._lock。**
 
         抽出来是为了让「核对代数」和「写入」待在**同一把锁**里 ——
         否则「核对完、还没写、又被 invalidate 换代」这个缝隙里，
         旧屏还是会被写回去，护栏就白加了。
+
+        返回 `(收下了吗, 要不要播)`。**「要不要播」必须在这把锁里定下来**
+        （它比的是锁保护着的 `_published_signature`），否则两个线程同时存屏时
+        可能都判成「变了」、把同一屏播两遍 —— 那正是这条去重要拦的事。
         """
         if self._at and read_at < self._at:
-            return False        # 这次读得比手上这份还早，丢弃
+            return False, False     # 这次读得比手上这份还早，丢弃（也不播）
         self._snapshot = snap
         self._at = read_at
         self._signature = self.signature(snap)
         self._last_seen = snap
         self._last_seen_at = read_at
-        return True
 
-    def note_if_current(self, snap, generation, read_at=None):
+        # 播不播：调用方要求播（source 非空）、有回调、且内容跟上一次播出去的不同。
+        if not source or self._on_screen is None:
+            return True, False
+        if self._signature == self._published_signature:
+            return True, False      # 屏幕没变，没有什么新东西要给用户看
+        self._published_signature = self._signature
+        return True, True
+
+    def note_if_current(self, snap, generation, read_at=None, source=""):
         """
         只在「还是这次预读开始时的那一代」时才收下 —— 收下了返回 True，
         已经换代（预读作废）返回 False。
@@ -201,12 +267,17 @@ class ScreenPrefetcher:
         用户完全可能又按了一下键（do_click → invalidate → 换代），此刻这份
         结果就是**点击前那一屏**。写进缓存的话，下一次按键会拿着过期坐标
         去点 —— 点了、不报错、但点的不是地方，正是本项目最忌讳的「静默点错」。
+
+        `source` 与播报的规矩跟 note() 一样（预读这条路传的是「预读」）。
         """
         read_at = time.monotonic() if read_at is None else read_at
         with self._lock:
             if generation != self._generation:
                 return False
-            return self._store_locked(snap, read_at)
+            stored, emit = self._store_locked(snap, read_at, source)
+        if emit:
+            self._emit(snap, source, read_at)
+        return stored
 
     def take(self):
         """
@@ -289,6 +360,10 @@ class ScreenPrefetcher:
         也**不动 _last_seen**（连同它读到的时刻 `_last_seen_at`）—— 它是"最近见过的界面"，
         给识别当上下文用，翻页判断和识别提示都靠它；按键那条「不等预读」的路
         也靠它（见 grab_screen 的 allow_stale）。所以 `_at` 清零了、它不清。
+        也**不动 _published_signature** —— 它记住的是「界面上现在摆着哪一屏」，
+        跟缓存作不作废是两件事：点击并不会让用户已经看到的那屏变成假的。
+        点击后预读读到的新屏跟它一比就知道要不要播；万一翻页没发生、读回来的
+        还是同一屏，那就不播（屏幕上本来也没变）。
         """
         with self._lock:
             self._snapshot = None
@@ -347,6 +422,10 @@ class ScreenPrefetcher:
             read_start = time.monotonic()
             try:
                 snap = screen.read_screen(self.adb.dump_ui())
+                # 这里**刻意没传 source**（本轮简报列的四处调用点里也没有它）。
+                # 开口时预读默认关着（见 config.prefetch.on_speech），而它读到的
+                # 这一屏紧接着就会被「点击后预读」读走的那一屏替换掉。
+                # 真开了这个开关、又想在界面和第二块看到它，加一句 source="预读" 即可。
                 self.note(snap, read_at=read_start)
             except Exception:  # noqa: BLE001
                 pass
@@ -383,8 +462,13 @@ class ScreenPrefetcher:
                 换代了（期间用户又点了一下）就把这份丢掉并说明白 ——
                 它反映的是点击前那一屏，写回缓存会让下一次按键拿着过期坐标
                 去点。收下了返回 True，作废了返回 False。
+
+                `source="预读"` 让这一屏同时播给界面和控制台：用户点完之后
+                的几秒里界面显示的就是这一屏，不用按键去「催」它（见 __init__
+                里 `_on_screen` 那段）。
                 """
-                if self.note_if_current(snap, generation, read_at=read_at):
+                if self.note_if_current(snap, generation, read_at=read_at,
+                                        source="预读"):
                     return True
                 self.log("       [预读] 期间又点了一下，这次预读作废"
                          "（结果反映的是点击前那一屏，不收）")
@@ -640,10 +724,12 @@ def grab_screen(ctx, use_prefetch=True, allow_stale=False):
     xml = ctx["adb"].dump_ui()
     read_ms = (time.monotonic() - read_start) * 1000
     snap = screen.read_screen(xml)
-    prefetcher.note(snap, read_at=read_start)
+    # 带上来源：note() 存下这一屏时会同时播给界面和控制台（见 ScreenPrefetcher）。
+    # **这里不要再自己调一次 publish_screen** —— 那就成了同一屏播两遍，
+    # 控制台上看得见（界面看起来倒是一样，所以只靠界面断言发现不了）。
+    prefetcher.note(snap, read_at=read_start, source="当场读屏")
     say(f"       [注意] 没有可用的预读结果（{prefetcher.miss_reason()}），"
         f"当场读了一次（{read_ms:.0f} 毫秒）")
-    publish_screen(ctx, snap, "当场读屏")
     return snap, f"当场读屏 {read_ms:.0f} 毫秒（{len(xml) // 1024} KB）"
 
 
@@ -670,7 +756,8 @@ def probe_startup_screen(adb, prefetcher, log=say):
         return None
 
     snap = screen.read_screen(xml)
-    prefetcher.note(snap, read_at=read_start)
+    # 带上来源，这一屏就同时播给界面和控制台（见 ScreenPrefetcher）
+    prefetcher.note(snap, read_at=read_start, source="启动时读到的")
     return snap
 
 
@@ -867,6 +954,38 @@ def publish_screen(ctx, snap, source, age=None):
         ok=snap.ok,
         reason=snap.reason,
     ))
+
+
+def make_screen_publisher(ctx, log=say):
+    """
+    造一个「把新读到的一屏播给**界面和控制台**」的回调，挂给预读器
+    （`ScreenPrefetcher(on_screen=...)`）。预读器每存下一份新屏就调它一次。
+
+    做成独立函数而不是 main() 里的闭包，理由和 make_action_putters 一样：
+    **接线只有这一处，测试才能拿到真接线** —— 在 main() 里另抄一份的话，
+    抄错的那个版本测不出来（这个项目已经在「界面在喊、没人接」上栽过两次）。
+
+    干两件事：
+
+      1. 喂界面 —— `publish_screen()`。界面第二块「程序读到的屏幕」就是它。
+      2. 打控制台 —— 先来一行标明这份屏是怎么来的，再复用 `show_screen()`
+         打题干和选项那两行。用户要的正是这个：一眼看出**这屏是预读的，
+         不是当前点击用的**（他的原话：控制台和界面都不显示预读的内容，
+         只有点击后才显示上一屏，完全滞后）。
+
+    `age` 由预读器一并算好带过来（那一屏是多少秒前读到的），不在这里再取一次：
+    再取一次要拿锁、而且万一这中间又发生了新的读屏，界面显示的屏和年龄就配不上对了。
+
+    **线程**：预读跑在后台线程里，这个回调也在那个线程里被执行 ——
+    `UiState` 是线程安全的（一把锁保护全部字段、写入是整体换引用），
+    `say()` 只是打印，都没问题。
+    """
+    def on_screen(snap, source, age):
+        publish_screen(ctx, snap, source, age)
+        log(f"[屏幕] （{source}）")
+        show_screen(snap, log=log)
+
+    return on_screen
 
 
 def note_input(ctx, kind, label, detail="", outcome=""):
@@ -1245,7 +1364,10 @@ def handle_force_read(ctx):
     read_ms = (time.monotonic() - started) * 1000
 
     snap = screen.read_screen(xml)
-    ctx["prefetcher"].note(snap)            # 存下来，接下来的数字键可以立刻用
+    # 存下来 + 播出去（界面和控制台）。接下来的数字键可以立刻用这份，
+    # 用户也立刻能在界面第二块看到「程序现在手里是哪一屏」——
+    # 强制读屏的整个用途就是手动纠偏，读到什么必须马上显示出来。
+    ctx["prefetcher"].note(snap, source="强制读屏")
 
     if not snap.ok:
         report_unusable_screen(snap)
@@ -1453,7 +1575,13 @@ def main(argv=None):
     section("准备界面读取")
     # 预读器要先建好：下面读到的这一屏要顺手存进它的缓存，
     # 否则启动后的第一次操作会因为没有缓存而当场读屏（白等约 2.4 秒）。
-    ctx["prefetcher"] = ScreenPrefetcher(adb, cfg, log=say)
+    #
+    # `on_screen` 是「存下一份新屏就播给界面和控制台」那条线（见 make_screen_publisher）。
+    # 挂在这里 —— 界面对象（ctx["ui"]）要到下面才建，但回调是闭包、调用时才取
+    # ctx["ui"]，所以不影响。副作用是启动这次播报只有控制台看得到（界面还没建），
+    # 界面要等第一次点击（或强制读屏）之后才有内容。
+    ctx["prefetcher"] = ScreenPrefetcher(adb, cfg, log=say,
+                                         on_screen=make_screen_publisher(ctx))
     startup_snap = probe_startup_screen(adb, ctx["prefetcher"], log=say)
     if startup_snap is not None:
         if startup_snap.ok:

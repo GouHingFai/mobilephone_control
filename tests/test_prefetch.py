@@ -71,8 +71,12 @@ class BlockingAdb:
         return self.xmls[index]
 
 
-def make_prefetcher(*xmls, **overrides):
-    """造一个用极小延时的预读器，让测试跑得快"""
+def make_prefetcher(*xmls, on_screen=None, **overrides):
+    """造一个用极小延时的预读器，让测试跑得快
+
+    `on_screen` 是「把新读到的一屏播出去」的回调（见 ScreenPrefetcher.__init__）。
+    不传 = 老行为（只存不播）。
+    """
     cfg = Config()
     params = dict(
         after_click=True,
@@ -86,7 +90,7 @@ def make_prefetcher(*xmls, **overrides):
 
     logs = []
     adb = SequenceAdb(*xmls) if xmls else SequenceAdb(FIRST_XML)
-    prefetcher = app.ScreenPrefetcher(adb, cfg, log=logs.append)
+    prefetcher = app.ScreenPrefetcher(adb, cfg, log=logs.append, on_screen=on_screen)
     return prefetcher, adb, logs, cfg
 
 
@@ -542,6 +546,152 @@ class TestFirstReadIsUsableWhileConfirming(unittest.TestCase):
             prefetcher.take(), "换代之后第二次读到的旧屏绝不许写回缓存")
         self.assertTrue(any("作废" in line for line in logs),
                         "这次预读被作废，日志里要说明白")
+
+
+class RecordingOnScreen:
+    """收集每一次「播出去」的屏幕：记下 `(快照, 来源, 年龄)`"""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, snap, source, age):
+        self.calls.append((snap, source, age))
+
+    def sources(self):
+        return [call[1] for call in self.calls]
+
+
+class TestBroadcastScreen(unittest.TestCase):
+    """
+    「程序手里是哪一屏」变了，就要**播出去**（界面 + 控制台）。
+
+    这是本轮修的缺陷（用户实测报告）：
+
+        控制台和可视化界面都不会显示预读的内容，只有点击后才显示之前的屏幕读屏，
+        这样完全滞后，没有意义。
+
+    病根不在「读得慢」，而在「读到了却不说」：预读在后台把新题读好之后只调了
+    `note()` 存进缓存，没有播出去。于是用户点完之后的那几秒（**正是他要用界面
+    核对「读屏读对了没有」的时间**）显示的都还是上一题，等他按下键界面才跳到
+    当前题 —— 而那时他已经点完了。永远慢一拍。
+
+    `note()` 是「程序对屏幕的认知」唯一的变更点，所以播报挂在它身上。规矩有两条：
+
+      1. **不传 source 就不播** —— note() 是底层写入，谁都没要求播就别出声
+         （默认 `source=""`，桩和别的调用点不必跟着改）。
+      2. **内容没变就不播**（比 `signature()`）—— 「还是旧界面 → 再读一次确认」
+         会把同一屏存两次，不去重的话控制台就把同一屏打两遍。屏幕没变，
+         本来也没有什么新东西要给用户看。
+    """
+
+    def test_no_callback_is_the_old_behaviour(self):
+        """不传 on_screen 时一切照旧 —— 带 source 调 note() 也不该抛"""
+        prefetcher, _adb, _logs, _cfg = make_prefetcher(FIRST_XML)
+        snap = screen.read_screen(FIRST_XML)
+
+        prefetcher.note(snap, source="预读")     # 没有回调，什么都不会发生
+
+        self.assertIs(prefetcher.take()[0], snap, "缓存照旧要写进去")
+
+    def test_no_source_means_no_broadcast(self):
+        """note() 不传 source = 没人要求播 → 一声不吭"""
+        seen = RecordingOnScreen()
+        prefetcher, _adb, _logs, _cfg = make_prefetcher(FIRST_XML, on_screen=seen)
+
+        prefetcher.note(screen.read_screen(FIRST_XML))
+
+        self.assertEqual(seen.calls, [], "没要求播就一个字都不该播")
+
+    def test_prefetch_broadcasts_the_new_screen(self):
+        """**主证据**：预读在后台读到新题 → 自己就播出去（用户不必再按键）"""
+        seen = RecordingOnScreen()
+        prefetcher, adb, _logs, _cfg = make_prefetcher(SECOND_XML, on_screen=seen)
+
+        prefetcher.note(screen.read_screen(FIRST_XML))    # 点击前那一屏，不播
+        prefetcher.invalidate()
+        prefetcher.trigger_after_click()
+        self.assertTrue(wait_idle(prefetcher))
+
+        self.assertEqual(adb.calls, 1, "先确认预读真的读了一次（读到新界面就收工）")
+        self.assertEqual(len(seen.calls), 1,
+                         f"预读读到的新屏要播出去，实际播了 {seen.calls!r}")
+        snap, source, age = seen.calls[0]
+        self.assertEqual(snap.prompt, "prototype", "播的应该是新题目那一屏")
+        self.assertEqual(source, "预读")
+        self.assertGreaterEqual(age, 0.0, "年龄要如实带出来")
+        self.assertLess(age, 5.0)
+
+    def test_same_screen_is_not_broadcast_twice(self):
+        """
+        界面一直没变（两次读到的内容一样）→ 只播一次。
+
+        「还是旧界面就再读一次确认」那条路会把同一屏存两次，不去重的话
+        控制台就把同一屏打两遍 —— 吵，而且用户一眼看过去还以为翻页了。
+        """
+        seen = RecordingOnScreen()
+        prefetcher, adb, _logs, _cfg = make_prefetcher(
+            FIRST_XML, FIRST_XML, on_screen=seen)
+
+        prefetcher.note(screen.read_screen(FIRST_XML))    # 点击前那一屏，不播
+        prefetcher.invalidate()
+        prefetcher.trigger_after_click()
+        self.assertTrue(wait_idle(prefetcher))
+
+        self.assertEqual(adb.calls, 2, "先确认真的读了两次（第一次 + 确认读）")
+        self.assertEqual(len(seen.calls), 1,
+                         f"同一屏只能播一次，实际播了 {len(seen.calls)} 次")
+
+    def test_a_screen_already_on_display_is_not_broadcast_again(self):
+        """
+        界面和控制台上**已经摆着**这一屏了 → 再读到它也不播。
+
+        这是真机上最常见的「吵」：答完一题界面没翻（比如点了「不记得了」之前
+        那一瞬），点击后预读读回来的还是同一屏 —— 不该把同一屏再刷一遍。
+        """
+        seen = RecordingOnScreen()
+        prefetcher, adb, _logs, _cfg = make_prefetcher(
+            FIRST_XML, FIRST_XML, on_screen=seen)
+
+        prefetcher.note(screen.read_screen(FIRST_XML), source="启动时读到的")
+        self.assertEqual(len(seen.calls), 1, "启动那一次是要播的")
+
+        prefetcher.invalidate()
+        prefetcher.trigger_after_click()
+        self.assertTrue(wait_idle(prefetcher))
+
+        self.assertEqual(adb.calls, 2, "预读确实又读了两次")
+        self.assertEqual(len(seen.calls), 1,
+                         "屏幕上本来就是这一屏，没什么新东西要给用户看")
+
+    def test_broadcast_only_when_content_changed(self):
+        """内容变了才播 —— 连着两次同样的屏，第二次不出声"""
+        seen = RecordingOnScreen()
+        prefetcher, _adb, _logs, _cfg = make_prefetcher(FIRST_XML, on_screen=seen)
+
+        prefetcher.note(screen.read_screen(FIRST_XML), source="强制读屏")
+        prefetcher.note(screen.read_screen(FIRST_XML), source="强制读屏")
+        self.assertEqual(len(seen.calls), 1, "屏幕没变，不该再播一遍")
+
+        prefetcher.note(screen.read_screen(SECOND_XML), source="强制读屏")
+        self.assertEqual(seen.sources(), ["强制读屏", "强制读屏"],
+                         "换了内容就要播（第二次播的是新屏）")
+        self.assertEqual(seen.calls[1][0].prompt, "prototype")
+
+    def test_a_discarded_read_is_not_broadcast(self):
+        """
+        被丢弃的那次读屏**不许播**。
+
+        理由跟「不许写回缓存」一样：它反映的是更早一刻的屏幕，播出去等于
+        告诉用户「现在屏幕上就是这个」—— 而那不是事实。
+        """
+        seen = RecordingOnScreen()
+        prefetcher, _adb, _logs, _cfg = make_prefetcher(FIRST_XML, on_screen=seen)
+
+        prefetcher.note(screen.read_screen(SECOND_XML), read_at=time.monotonic())
+        prefetcher.note(screen.read_screen(FIRST_XML), source="预读",
+                        read_at=time.monotonic() - 5.0)     # 5 秒前就开始读了
+
+        self.assertEqual(seen.calls, [], "被丢弃的那一份不该播出去")
 
 
 class TestTriggerOnSpeech(unittest.TestCase):

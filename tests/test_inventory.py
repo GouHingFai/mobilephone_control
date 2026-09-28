@@ -63,7 +63,16 @@ BASELINE_COUNTS = {
     #   「一次都没读到过时才当场读一次」（这一档行为未变，是护栏）
     #   「语音那条路没被改：缓存空仍然当场读屏，不用 peek 的旧坐标」
     # 第一条是这次改动的主证据（改之前 dump_calls == 1，改之后 == 0）。
-    "tests.test_pipeline": 123,
+    # 2026-09-28（任务 8）：123 → 128 —— 预读读到的屏要**播出去**（用户实测：
+    # 界面和控制台只显示点击前那一屏，永远慢一拍）。新增五条：
+    #   TestForceRead.test_broadcasts_the_fresh_screen_to_the_ui（强制读屏 → 来源「强制读屏」）
+    #   TestScreenPublisher 两条（播给界面 + 控制台那行来源；没开界面时照打）
+    #   TestUiStateWiring.test_grab_screen_publishes_the_fresh_read_only_once
+    #     （当场读屏那条路只能播一遍 —— 播报搬进 note() 之后，原来那句
+    #      publish_screen 必须去掉；两处都留着界面看着一样，只有次数分得出来）
+    #   TestPrefetchedScreenReachesTheUiWithNoExtraKey 一条（**主证据**：
+    #     只按一次键、之后不再有任何输入，界面里那一屏自己变成新题）
+    "tests.test_pipeline": 128,
     # 26 → 27：预读改成「最多读两次」（见 test_prefetch.py）。原有的
     # 「试满次数再放弃」改写成「一直没变也收下」（1 条），另加「读到新界面只读一次」（1 条），
     # 共 +1。
@@ -79,7 +88,14 @@ BASELINE_COUNTS = {
     # `_last_seen_at` 不清，混用会喊出「开机以来」那么大的数）、以及
     # 「超过 cache_max_age 也照样交出来」——最后这条钉的是用户明确要的
     # 「不做时间保险、一律不等」，是取舍不是遗漏。净 +4。
-    "tests.test_prefetch": 33,
+    # 2026-09-28（任务 8）：33 → 40 —— `ScreenPrefetcher` 新增 `on_screen` 回调：
+    # note() 每存下一份新屏就播给界面和控制台。落成 TestBroadcastScreen 七条：
+    #   不传回调 = 老行为（照旧只存不播）、note() 不传 source 就不播、
+    #   **预读读到新界面会自己播出去（主证据，来源「预读」）**、
+    #   同一屏不播两遍（「还是旧界面 → 再读一次确认」那条路会把同一屏存两次）、
+    #   已经摆在界面上的一屏不再播（翻页没发生时控制台不被刷第二遍）、
+    #   内容变了才播、被丢弃的旧读屏不许播（理由同「不许写回缓存」）。
+    "tests.test_prefetch": 40,
     "tests.test_screen": 27,
     # 7：UiState（线程安全状态黑板）—— 界面与主逻辑唯一的交汇点
     "tests.test_ui_state": 7,
@@ -95,6 +111,10 @@ REQUIRED_CLASSES = {
         "TestNextButton",                  # 答错后能翻回下一题
         "TestPrefetchIsTriggeredAfterClick",
         "TestCachedScreenIsUsed",          # 预读的界面要被真正用上
+        # 2026-09-28（任务 8）：预读读到的屏要**自己**出现在界面上（不用再按键）——
+        # 这是用户实测那个「永远慢一拍」的缺陷本身。删掉它，这条线就没有用例拦得住了。
+        "TestPrefetchedScreenReachesTheUiWithNoExtraKey",
+        "TestScreenPublisher",             # 播给界面 + 控制台（接线只此一处）
         # 2026-09-28（任务 7）：按键「不等预读、直接用最近读到那一屏的坐标」是本轮
         # 唯一重新引入「用旧坐标点新题」风险的决定（用户明确选的取舍）。这一整类
         # 就是那道风险的记录：删掉它，改动本身就没有任何用例能拦住回归了。
@@ -155,6 +175,11 @@ REQUIRED_CLASSES = {
         "TestTriggerAfterClick",           # 翻页检测
         "TestPeek",                        # 识别要用的「最近见过的界面」
         "TestMissReason",                  # 落空要能说清「没有」还是「过期了」
+        # 2026-09-28（任务 8）：预读读到的新屏要**播出去**（界面 + 控制台）——
+        # 用户实测「只有点击后才显示上一屏，永远慢一拍」就是这个没接上。
+        # 整类删掉时用例数会掉到基线以下，但**改成等量的无关测试**就发现不了，
+        # 所以按名字钉住。
+        "TestBroadcastScreen",             # 存下一份新屏就播；同一屏不播两遍
     ],
     "tests.test_voice_gate": [
         "TestSuppress",                    # 静音期
